@@ -337,6 +337,7 @@ pub struct AnthropicUsage {
 pub struct ModelLoadRequest {
     pub model: String,
     pub adapter: Option<String>,
+    pub drafter: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

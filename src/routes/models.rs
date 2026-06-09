@@ -39,7 +39,7 @@ pub async fn load_model(
     State(state): State<AppState>,
     Json(req): Json<ModelLoadRequest>,
 ) -> impl IntoResponse {
-    match state.mlx.load_model(req.model.clone(), req.adapter).await {
+    match state.mlx.load_model_with_drafter(req.model.clone(), req.adapter, req.drafter).await {
         Ok(_) => (StatusCode::OK, Json(json!(ModelObject::new(req.model)))).into_response(),
         Err(e) => e.into_response(),
     }
