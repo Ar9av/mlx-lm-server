@@ -9,10 +9,10 @@ Best demo: play music from speakers while you talk, then run this —
 it should extract your voice in target and leave the music in residual.
 
 Usage:
-  python sts_demo.py                          # record 5s, description "speech"
-  python sts_demo.py --duration 8             # record 8s
-  python sts_demo.py --description "music"    # extract music instead
-  python sts_demo.py --mix background.wav     # mix a background track into recording
+  python examples/sts_demo.py                          # record 5s, description "speech"
+  python examples/sts_demo.py --duration 8             # record 8s
+  python examples/sts_demo.py --description "music"    # extract music instead
+  python examples/sts_demo.py --mix background.wav     # mix a background track into recording
 """
 import argparse
 import base64
@@ -34,11 +34,11 @@ CHANNELS = 1
 
 def record(seconds: float) -> np.ndarray:
     """Record from mic at MODEL_SR, return float32 mono array."""
-    print(f"  🎙  Recording {seconds}s — speak now (play background music for best results)!")
+    print(f"  Recording {seconds}s — speak now (play background music for best results)!")
     frames = sd.rec(int(seconds * MODEL_SR), samplerate=MODEL_SR,
                     channels=CHANNELS, dtype="float32")
     sd.wait()
-    print("  ✓  Done.")
+    print("  Done.")
     return frames.squeeze()
 
 
@@ -88,7 +88,7 @@ def separate(wav_bytes: bytes, description: str, server: str) -> tuple[bytes, by
         timeout=180,
     )
     if resp.status_code != 200:
-        print(f"  ✗  Server {resp.status_code}: {resp.text}", file=sys.stderr)
+        print(f"  Server {resp.status_code}: {resp.text}", file=sys.stderr)
         sys.exit(1)
     data = resp.json()
     target = base64.b64decode(data["target_url"].split(",")[1])
@@ -100,7 +100,7 @@ def play_and_stats(wav_bytes: bytes, label: str):
     buf = io.BytesIO(wav_bytes)
     audio, sr = sf.read(buf, dtype="float32")
     db = rms_db(audio)
-    print(f"  ▶  {label}  ({len(audio)/sr:.1f}s  RMS {db:.1f} dBFS)")
+    print(f"  {label}  ({len(audio)/sr:.1f}s  RMS {db:.1f} dBFS)")
     sd.play(audio, sr)
     sd.wait()
 
@@ -121,11 +121,11 @@ def main():
     try:
         health = requests.get(f"{args.server}/health", timeout=5).json()
     except Exception as e:
-        print(f"  ✗  Can't reach {args.server}: {e}", file=sys.stderr)
+        print(f"  Can't reach {args.server}: {e}", file=sys.stderr)
         sys.exit(1)
 
     if not health.get("sts_model"):
-        print("  ✗  No STS model loaded on server.", file=sys.stderr)
+        print("  No STS model loaded on server.", file=sys.stderr)
         sys.exit(1)
 
     print(f"\n  Server  : {args.server}")
@@ -147,7 +147,7 @@ def main():
         voice = record(args.duration)
 
         if bg is not None:
-            print(f"  Mixing background at gain {args.bg_gain} …")
+            print(f"  Mixing background at gain {args.bg_gain} ...")
             signal = mix(voice, bg, args.bg_gain)
         else:
             signal = voice
@@ -156,11 +156,11 @@ def main():
         print(f"  Input RMS: {input_db:.1f} dBFS")
 
         wav_bytes = to_wav_bytes(signal, MODEL_SR)
-        print(f"  Sending {len(wav_bytes)//1024}KB to server …")
+        print(f"  Sending {len(wav_bytes)//1024}KB to server ...")
 
         t0 = time.time()
         target, residual = separate(wav_bytes, args.description, args.server)
-        print(f"  ✓  Separated in {time.time()-t0:.1f}s\n")
+        print(f"  Separated in {time.time()-t0:.1f}s\n")
 
         play_and_stats(target,   f"TARGET   — should contain: \"{args.description}\"")
         play_and_stats(residual, f"RESIDUAL — everything else")
@@ -170,7 +170,7 @@ def main():
                 path = args.save + suffix
                 with open(path, "wb") as f:
                     f.write(data)
-                print(f"  💾  {path}")
+                print(f"  Saved: {path}")
         print()
 
 

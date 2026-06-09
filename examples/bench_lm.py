@@ -5,12 +5,14 @@ import time
 import json
 import subprocess
 import os
-import signal
 import sys
 import statistics
 import threading
 import urllib.request
 import urllib.error
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.join(_HERE, "..")
 
 BASE = "http://localhost:8765"
 MODEL = "mlx-community/Llama-3.2-1B-Instruct-4bit"
@@ -105,9 +107,7 @@ def bench_ttft(label, prompt, max_tokens=200):
             choices = chunk.get("choices", [])
             if choices and choices[0].get("delta", {}).get("content"):
                 results.append(elapsed)
-                # drain rest
                 break
-        # drain remaining
         try:
             for _ in post_stream("/v1/chat/completions", body):
                 pass
@@ -167,9 +167,9 @@ def bench_stream_throughput(label, prompt, max_tokens=200):
     if not runs:
         return None
     return (
-        statistics.mean(r[0] for r in runs),  # avg TTFT
-        statistics.mean(r[3] for r in runs),  # avg tps
-        statistics.mean(r[2] for r in runs),  # avg tokens
+        statistics.mean(r[0] for r in runs),
+        statistics.mean(r[3] for r in runs),
+        statistics.mean(r[2] for r in runs),
     )
 
 def bench_concurrent(n_concurrent=4, max_tokens=80):
@@ -207,8 +207,8 @@ def bench_concurrent(n_concurrent=4, max_tokens=80):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    binary = os.path.join(os.path.dirname(__file__), "target/release/mlx-lm-server")
-    venv = os.path.join(os.path.dirname(__file__), ".venv")
+    binary = os.path.join(_ROOT, "target/release/mlx-lm-server")
+    venv = os.path.join(_ROOT, ".venv")
     env = {
         **os.environ,
         "MLX_PORT": "8765",
@@ -221,7 +221,6 @@ def main():
     print("  mlx-lm-server benchmark")
     print("=" * 60)
 
-    # ── startup ───────────────────────────────────────────────────────────────
     print("\n[1/5] Cold-start latency...")
     proc, startup_s = bench_startup(binary, env)
     if proc is None:
@@ -230,7 +229,6 @@ def main():
     print(f"  Cold start:  {startup_s*1000:.0f} ms")
     print(f"  Idle RSS:    {idle_mem:.1f} MB")
 
-    # ── model load ────────────────────────────────────────────────────────────
     print(f"\n[2/5] Model load: {MODEL} ...")
     t0 = time.perf_counter()
     post("/v1/models/load", {"model": MODEL})
@@ -240,7 +238,6 @@ def main():
     print(f"  Loaded RSS:  {loaded_mem:.1f} MB")
     print(f"  Model delta: {loaded_mem - idle_mem:.1f} MB")
 
-    # ── non-streaming throughput ──────────────────────────────────────────────
     print("\n[3/5] Non-streaming throughput (3 runs each)...")
     for key, prompt in PROMPTS.items():
         r = bench_throughput(key, prompt)
@@ -249,7 +246,6 @@ def main():
             print(f"  {key:6s}: {tps:6.1f} tok/s  |  {elapsed:.2f}s  |  {tokens:.0f} tokens")
     peak_mem = proc_mem_mb(proc.pid)
 
-    # ── streaming TTFT + throughput ───────────────────────────────────────────
     print("\n[4/5] Streaming: TTFT + throughput (3 runs each)...")
     for key, prompt in PROMPTS.items():
         r = bench_stream_throughput(key, prompt)
@@ -260,7 +256,6 @@ def main():
     peak_mem2 = proc_mem_mb(proc.pid)
     print(f"\n  Peak RSS during inference: {max(peak_mem, peak_mem2):.1f} MB")
 
-    # ── concurrency ───────────────────────────────────────────────────────────
     print("\n[5/5] Concurrency: 4 parallel requests...")
     lats, wall, errs = bench_concurrent(n_concurrent=4, max_tokens=80)
     if lats:
@@ -269,7 +264,6 @@ def main():
         print(f"  Min/Max:     {min(lats):.2f}s / {max(lats):.2f}s")
         print(f"  Errors:      {len(errs)}")
 
-    # ── summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  SUMMARY")
     print("=" * 60)
@@ -289,7 +283,6 @@ def main():
         print(f"  TTFT (short prompt):        {stream_short[0]*1000:.0f} ms")
     print("=" * 60)
 
-    # shut down
     proc.terminate()
     proc.wait()
 
