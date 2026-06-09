@@ -64,6 +64,7 @@ async fn main() {
         .route("/", get(routes::health::root))
         .route("/health", get(routes::health::health))
         .route("/status", get(routes::health::status))
+        .route("/llms.txt", get(routes::health::llms_txt))
         // OpenAI-compatible
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
