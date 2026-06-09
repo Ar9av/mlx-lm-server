@@ -21,6 +21,7 @@ struct LoadedModel {
     model_id: String,
     loaded_at: Instant,
     loaded_at_unix: u64,
+    draft_model: Option<Py<PyAny>>,
 }
 
 struct Inner {
@@ -58,6 +59,15 @@ impl MlxService {
     }
 
     pub async fn load_model(&self, model_id: String, adapter: Option<String>) -> Result<(), MlxError> {
+        self.load_model_with_drafter(model_id, adapter, None).await
+    }
+
+    pub async fn load_model_with_drafter(
+        &self,
+        model_id: String,
+        adapter: Option<String>,
+        drafter: Option<String>,
+    ) -> Result<(), MlxError> {
         {
             let guard = self.inner.lock().await;
             if guard.loaded.as_ref().map(|l| l.model_id == model_id).unwrap_or(false) {
@@ -79,10 +89,10 @@ impl MlxService {
             check_model_size(&model_id, max_gb).await?;
         }
 
-        info!("Loading model: {} (adapter: {:?})", model_id, adapter);
+        info!("Loading model: {} (adapter: {:?}, drafter: {:?})", model_id, adapter, drafter);
         let mid = model_id.clone();
-        let (model_py, tokenizer_py) = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> PyResult<(PyObject, PyObject)> {
+        let (model_py, tokenizer_py, draft_model_py) = tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<(PyObject, PyObject, Option<PyObject>)> {
                 let mlx_lm = py.import("mlx_lm")?;
                 let kwargs = PyDict::new(py);
                 if let Some(path) = &adapter {
@@ -91,7 +101,17 @@ impl MlxService {
                 let result = mlx_lm.getattr("load")?.call((&mid,), Some(kwargs))?;
                 let model: PyObject = result.get_item(0)?.into();
                 let tokenizer: PyObject = result.get_item(1)?.into();
-                Ok((model, tokenizer))
+
+                let draft = if let Some(ref drafter_id) = drafter {
+                    info!("Loading draft model: {}", drafter_id);
+                    let d_result = mlx_lm.getattr("load")?.call((drafter_id.as_str(),), None)?;
+                    let d_model: PyObject = d_result.get_item(0)?.into();
+                    Some(d_model)
+                } else {
+                    None
+                };
+
+                Ok((model, tokenizer, draft))
             })
         })
         .await
@@ -110,6 +130,7 @@ impl MlxService {
             model_id,
             loaded_at: Instant::now(),
             loaded_at_unix,
+            draft_model: draft_model_py,
         });
         info!("Model loaded successfully");
         Ok(())
@@ -134,7 +155,7 @@ impl MlxService {
     }
 
     pub async fn tokenize(&self, text: String) -> Result<Vec<i64>, MlxError> {
-        let (_, tokenizer_py) = self.get_model_refs().await?;
+        let (_, tokenizer_py, _) = self.get_model_refs().await?;
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<Vec<i64>> {
                 tokenizer_py.as_ref(py).call_method1("encode", (text.as_str(),))?.extract()
@@ -146,7 +167,7 @@ impl MlxService {
     }
 
     pub async fn get_embeddings(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MlxError> {
-        let (model_py, tokenizer_py) = self.get_model_refs().await?;
+        let (model_py, tokenizer_py, _) = self.get_model_refs().await?;
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<Vec<Vec<f32>>> {
                 let model = model_py.as_ref(py);
@@ -203,7 +224,7 @@ impl MlxService {
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
     ) -> Result<(String, usize, usize), MlxError> {
-        let (model_py, tokenizer_py) = self.get_model_refs().await?;
+        let (model_py, tokenizer_py, _) = self.get_model_refs().await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         tokio::task::spawn_blocking(move || {
@@ -243,7 +264,7 @@ impl MlxService {
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
     ) -> Result<(String, usize, usize), MlxError> {
-        let (model_py, tokenizer_py) = self.get_model_refs().await?;
+        let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs().await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
@@ -263,6 +284,9 @@ impl MlxService {
                 if let Some(bits) = kv_bits {
                     kwargs.set_item("kv_bits", bits)?;
                     kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                }
+                if let Some(ref draft) = draft_model_py {
+                    kwargs.set_item("draft_model", draft.as_ref(py))?;
                 }
 
                 let response: String = mlx_lm
@@ -292,7 +316,7 @@ impl MlxService {
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
     ) -> Result<ReceiverStream<Result<String, MlxError>>, MlxError> {
-        let (model_py, tokenizer_py) = self.get_model_refs().await?;
+        let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs().await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, MlxError>>(64);
 
@@ -314,6 +338,9 @@ impl MlxService {
                     if let Some(bits) = kv_bits {
                         kwargs.set_item("kv_bits", bits)?;
                         kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                    }
+                    if let Some(ref draft) = draft_model_py {
+                        kwargs.set_item("draft_model", draft.as_ref(py))?;
                     }
 
                     let generator = mlx_lm
@@ -345,13 +372,17 @@ impl MlxService {
         Ok(ReceiverStream::new(rx))
     }
 
-    async fn get_model_refs(&self) -> Result<(Py<PyAny>, Py<PyAny>), MlxError> {
+    async fn get_model_refs(&self) -> Result<(Py<PyAny>, Py<PyAny>, Option<Py<PyAny>>), MlxError> {
         let guard = self.inner.lock().await;
         let loaded = guard.loaded.as_ref().ok_or(MlxError::NotLoaded)?;
-        let (m, t) = Python::with_gil(|py| {
-            (loaded.model.clone_ref(py), loaded.tokenizer.clone_ref(py))
+        let (m, t, d) = Python::with_gil(|py| {
+            (
+                loaded.model.clone_ref(py),
+                loaded.tokenizer.clone_ref(py),
+                loaded.draft_model.as_ref().map(|d| d.clone_ref(py)),
+            )
         });
-        Ok((m, t))
+        Ok((m, t, d))
     }
 
     pub fn new_chat_id() -> String {
