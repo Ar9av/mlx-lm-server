@@ -20,5 +20,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check
-        run: PYO3_PYTHON=$(which python3.12) cargo check
+      - name: Check workspace
+        run: PYO3_PYTHON=$(which python3.12) cargo check --workspace

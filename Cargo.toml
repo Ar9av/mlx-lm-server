@@ -1,20 +1,16 @@
-[package]
-name = "mlx-lm-server"
+[workspace]
+members = ["mlx-lm-server", "mlx-audio-server"]
+resolver = "2"
+
+[workspace.package]
 version = "0.2.0"
 edition = "2021"
-description = "OpenAI-compatible MLX LM inference server for Apple Silicon"
 license = "MIT"
 repository = "https://github.com/Ar9av/mlx-lm-server"
 homepage = "https://github.com/Ar9av/mlx-lm-server"
-keywords = ["mlx", "llm", "apple-silicon", "openai", "inference"]
-categories = ["web-programming::http-server"]
 rust-version = "1.75"
 
-[[bin]]
-name = "mlx-lm-server"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -29,3 +25,5 @@ tokio-stream = "0.1"
 futures = "0.3"
 thiserror = "1"
 bytes = "1"
+tempfile = "3"
+base64 = "0.22"

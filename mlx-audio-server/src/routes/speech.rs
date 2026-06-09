@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     Json,
 };
 use futures::StreamExt;
