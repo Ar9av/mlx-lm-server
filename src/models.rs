@@ -54,6 +54,8 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub chat_template_kwargs: serde_json::Value,
+    pub kv_bits: Option<u32>,
+    pub kv_group_size: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +159,8 @@ pub struct CompletionRequest {
     pub stop: Option<StopSequence>,
     pub suffix: Option<String>,
     pub n: Option<u32>,
+    pub kv_bits: Option<u32>,
+    pub kv_group_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +260,8 @@ pub struct AnthropicRequest {
     #[serde(default)]
     pub stream: bool,
     pub stop_sequences: Option<Vec<String>>,
+    pub kv_bits: Option<u32>,
+    pub kv_group_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

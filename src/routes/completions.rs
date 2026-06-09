@@ -33,6 +33,8 @@ pub async fn completions(
         max_tokens,
         temperature,
         top_p,
+        req.kv_bits,
+        req.kv_group_size,
     ).await {
         Ok((text, prompt_tokens, completion_tokens)) => {
             let resp = CompletionResponse::new(

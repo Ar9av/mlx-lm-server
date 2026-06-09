@@ -200,6 +200,8 @@ impl MlxService {
         max_tokens: usize,
         temperature: f64,
         top_p: f64,
+        kv_bits: Option<u32>,
+        kv_group_size: Option<u32>,
     ) -> Result<(String, usize, usize), MlxError> {
         let (model_py, tokenizer_py) = self.get_model_refs().await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
@@ -214,6 +216,10 @@ impl MlxService {
                 kwargs.set_item("prompt", prompt.as_str())?;
                 kwargs.set_item("max_tokens", max_tokens as i64)?;
                 kwargs.set_item("sampler", sampler)?;
+                if let Some(bits) = kv_bits {
+                    kwargs.set_item("kv_bits", bits)?;
+                    kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                }
                 let response: String = mlx_lm
                     .getattr("generate")?
                     .call((model_py.as_ref(py), tokenizer), Some(kwargs))?
@@ -234,6 +240,8 @@ impl MlxService {
         temperature: f64,
         top_p: f64,
         chat_template_kwargs: serde_json::Value,
+        kv_bits: Option<u32>,
+        kv_group_size: Option<u32>,
     ) -> Result<(String, usize, usize), MlxError> {
         let (model_py, tokenizer_py) = self.get_model_refs().await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
@@ -252,6 +260,10 @@ impl MlxService {
                 kwargs.set_item("prompt", &prompt)?;
                 kwargs.set_item("max_tokens", max_tokens as i64)?;
                 kwargs.set_item("sampler", sampler)?;
+                if let Some(bits) = kv_bits {
+                    kwargs.set_item("kv_bits", bits)?;
+                    kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                }
 
                 let response: String = mlx_lm
                     .getattr("generate")?
@@ -277,6 +289,8 @@ impl MlxService {
         top_p: f64,
         timeout_secs: f64,
         chat_template_kwargs: serde_json::Value,
+        kv_bits: Option<u32>,
+        kv_group_size: Option<u32>,
     ) -> Result<ReceiverStream<Result<String, MlxError>>, MlxError> {
         let (model_py, tokenizer_py) = self.get_model_refs().await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
@@ -297,6 +311,10 @@ impl MlxService {
                     kwargs.set_item("prompt", &prompt)?;
                     kwargs.set_item("max_tokens", max_tokens as i64)?;
                     kwargs.set_item("sampler", sampler)?;
+                    if let Some(bits) = kv_bits {
+                        kwargs.set_item("kv_bits", bits)?;
+                        kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                    }
 
                     let generator = mlx_lm
                         .getattr("stream_generate")?
