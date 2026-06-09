@@ -1,0 +1,32 @@
+[package]
+name = "mlx-audio-server"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible audio inference server (TTS/STT/STS) for Apple Silicon using MLX"
+license = "MIT"
+repository = "https://github.com/Ar9av/mlx-audio-server"
+keywords = ["mlx", "tts", "stt", "audio", "apple-silicon"]
+rust-version = "1.75"
+
+[[bin]]
+name = "mlx-audio-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pyo3 = { version = "0.22", features = ["auto-initialize", "gil-refs"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+tokio-stream = "0.1"
+futures = "0.3"
+thiserror = "1"
+bytes = "1"
+tempfile = "3"
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+
