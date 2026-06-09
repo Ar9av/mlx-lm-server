@@ -72,6 +72,7 @@ async fn main() {
         .route("/v1/tokenize", post(routes::chat::tokenize))
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/models/load", post(routes::models::load_model))
+        .route("/v1/models/:model_id/info", get(routes::models::model_info))
         .route("/v1/models/*model_id", delete(routes::models::unload_model))
         // Adapter management
         .route("/v1/adapters", get(routes::adapters::list_adapters))

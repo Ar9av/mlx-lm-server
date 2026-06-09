@@ -13,7 +13,7 @@ use tokio::fs;
 use tracing::warn;
 
 use crate::mlx_service::process_rss_mb;
-use crate::models::{HfModel, LocalModel, ModelList, ModelLoadRequest, ModelObject, PsResponse, QuantizationInfo};
+use crate::models::{HfModel, LocalModel, ModelInfo, ModelList, ModelLoadRequest, ModelObject, PsResponse, QuantizationInfo};
 use crate::state::AppState;
 
 // ── /v1/models — returns all locally cached models (loaded model marked) ─────
@@ -79,6 +79,91 @@ pub async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
         loaded_at,
         memory_mb: process_rss_mb(),
         pid: std::process::id(),
+    })
+}
+
+// ── /v1/models/{id}/info — rich model metadata ───────────────────────────────
+
+pub async fn model_info(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> impl IntoResponse {
+    let loaded_model = state.mlx.current_model().await;
+    let loaded = loaded_model.as_deref() == Some(model_id.as_str());
+
+    let cache = hf_cache_dir();
+    let dir_name = format!("models--{}", model_id.replace('/', "--"));
+    let snap_path = cache.join(&dir_name).join("snapshots");
+
+    // Find latest snapshot
+    let latest_snap = async {
+        let mut snaps = fs::read_dir(&snap_path).await.ok()?;
+        let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+        while let Ok(Some(entry)) = snaps.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                if let Ok(mt) = meta.modified() {
+                    if latest.as_ref().map(|(t, _)| mt > *t).unwrap_or(true) {
+                        latest = Some((mt, entry.path()));
+                    }
+                }
+            }
+        }
+        latest.map(|(_, p)| p)
+    }.await;
+
+    let (size_bytes, quantization, vision, architecture, context_length) = if let Some(snap) = latest_snap {
+        let size_bytes = Some(dir_size(&snap).await);
+        let quantization = read_quantization(&snap).await;
+
+        let (vision, architecture, context_length) = if let Ok(data) = fs::read_to_string(snap.join("config.json")).await {
+            if let Ok(cfg) = serde_json::from_str::<Value>(&data) {
+                let is_vision = cfg.get("vision_config").is_some()
+                    || cfg.get("image_size").is_some()
+                    || cfg.pointer("/model_type")
+                        .and_then(|v| v.as_str())
+                        .map(|t| ["llava", "llava_next", "qwen2_vl", "phi3_v", "idefics"].contains(&t))
+                        .unwrap_or(false);
+                let arch = cfg.get("architectures")
+                    .and_then(|a| a.get(0))
+                    .or_else(|| cfg.get("model_type"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let ctx = cfg.get("max_position_embeddings")
+                    .or_else(|| cfg.get("max_seq_len"))
+                    .or_else(|| cfg.get("n_positions"))
+                    .and_then(|v| v.as_u64());
+                (is_vision, arch, ctx)
+            } else {
+                (false, None, None)
+            }
+        } else {
+            (false, None, None)
+        };
+
+        (size_bytes, quantization, vision, architecture, context_length)
+    } else {
+        (None, None, false, None, None)
+    };
+
+    let size_gb = size_bytes.map(|b| b as f64 / 1_073_741_824.0);
+
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    Json(ModelInfo {
+        id: model_id,
+        object: "model",
+        created,
+        owned_by: "mlx-lm-server".into(),
+        size_bytes,
+        size_gb,
+        quantization,
+        vision,
+        architecture,
+        context_length,
+        loaded,
     })
 }
 

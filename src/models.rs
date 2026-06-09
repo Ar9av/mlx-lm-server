@@ -468,6 +468,23 @@ pub struct QuantizationInfo {
     pub group_size: Option<serde_json::Value>,
 }
 
+// ── Rich model info ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: String,
+    pub size_bytes: Option<u64>,
+    pub size_gb: Option<f64>,
+    pub quantization: Option<QuantizationInfo>,
+    pub vision: bool,
+    pub architecture: Option<String>,
+    pub context_length: Option<u64>,
+    pub loaded: bool,
+}
+
 // ── Adapter management ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
