@@ -1,0 +1,25 @@
+[package]
+name = "mlx-lm-server"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible MLX LM inference server for Apple Silicon"
+
+[[bin]]
+name = "mlx-lm-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pyo3 = { version = "0.22", features = ["auto-initialize", "gil-refs"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+tokio-stream = "0.1"
+futures = "0.3"
+thiserror = "1"
+bytes = "1"
