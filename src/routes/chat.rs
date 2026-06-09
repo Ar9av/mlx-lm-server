@@ -63,6 +63,7 @@ pub async fn chat_completions(
     let chat_template_kwargs = req.chat_template_kwargs.clone();
     let kv_bits = req.kv_bits;
     let kv_group_size = req.kv_group_size;
+    let adapter_name = req.adapter_name.clone();
 
     let permit = match state.inference_sem.clone().acquire_owned().await {
         Ok(p) => p,
@@ -71,9 +72,9 @@ pub async fn chat_completions(
     };
 
     if req.stream.unwrap_or(false) {
-        stream_response(state, req, messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, permit).await
+        stream_response(state, req, messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
     } else {
-        sync_response(state, req, messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, permit).await
+        sync_response(state, req, messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
     }
 }
 
@@ -87,12 +88,13 @@ async fn sync_response(
     chat_template_kwargs: serde_json::Value,
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
+    adapter_name: Option<String>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     info!("Generating sync response for model {}", model_name);
 
-    match state.mlx.generate_response(messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size).await {
+    match state.mlx.generate_response(messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, adapter_name).await {
         Ok((content, prompt_tokens, completion_tokens)) => {
             let resp = ChatCompletionResponse::new(
                 MlxService::new_chat_id(),
@@ -119,6 +121,7 @@ async fn stream_response(
     chat_template_kwargs: serde_json::Value,
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
+    adapter_name: Option<String>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
@@ -126,7 +129,7 @@ async fn stream_response(
     let timeout = state.config.stream_timeout;
 
     let token_stream = match state.mlx.generate_stream(
-        messages, max_tokens, temperature, top_p, timeout, chat_template_kwargs, kv_bits, kv_group_size,
+        messages, max_tokens, temperature, top_p, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),

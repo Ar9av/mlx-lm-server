@@ -72,6 +72,10 @@ async fn main() {
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/models/load", post(routes::models::load_model))
         .route("/v1/models/*model_id", delete(routes::models::unload_model))
+        // Adapter management
+        .route("/v1/adapters", get(routes::adapters::list_adapters))
+        .route("/v1/adapters/mount", post(routes::adapters::mount_adapter))
+        .route("/v1/adapters/:name", delete(routes::adapters::unmount_adapter))
         // Anthropic-compatible
         .route("/v1/messages", post(routes::anthropic::messages))
         // Model cache + discovery
