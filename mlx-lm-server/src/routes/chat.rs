@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::error::MlxError;
 use crate::mlx_service::{MlxService, MAX_MESSAGE_TOKENS};
-use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent, TokenizeRequest, TokenizeResponse, Usage};
+use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent, SamplerParams, TokenizeRequest, TokenizeResponse, Usage};
 use crate::state::AppState;
 
 pub async fn chat_completions(
@@ -90,8 +90,16 @@ pub async fn chat_completions(
     }
 
     let max_tokens = req.max_tokens.unwrap_or(state.config.default_max_tokens);
-    let temperature = req.temperature.unwrap_or(state.config.default_temperature);
-    let top_p = req.top_p.unwrap_or(state.config.default_top_p);
+    let sampler = SamplerParams {
+        temperature: req.temperature.unwrap_or(state.config.default_temperature),
+        top_p: req.top_p.unwrap_or(state.config.default_top_p),
+        top_k: req.top_k,
+        min_p: req.min_p,
+        repetition_penalty: req.repetition_penalty,
+        presence_penalty: req.presence_penalty,
+        frequency_penalty: req.frequency_penalty,
+        num_draft_tokens: req.num_draft_tokens,
+    };
     let chat_template_kwargs = req.chat_template_kwargs.clone();
     let kv_bits = req.kv_bits;
     let kv_group_size = req.kv_group_size;
@@ -104,9 +112,9 @@ pub async fn chat_completions(
     };
 
     if req.stream.unwrap_or(false) {
-        stream_response(state, req, messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
+        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
     } else {
-        sync_response(state, req, messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
+        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
     }
 }
 
@@ -115,8 +123,7 @@ async fn sync_response(
     req: ChatCompletionRequest,
     messages: Vec<ChatMessage>,
     max_tokens: usize,
-    temperature: f64,
-    top_p: f64,
+    sampler: SamplerParams,
     chat_template_kwargs: serde_json::Value,
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
@@ -126,7 +133,7 @@ async fn sync_response(
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     info!("Generating sync response for model {}", model_name);
 
-    match state.mlx.generate_response(messages, max_tokens, temperature, top_p, chat_template_kwargs, kv_bits, kv_group_size, adapter_name).await {
+    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name).await {
         Ok((content, prompt_tokens, completion_tokens)) => {
             let resp = ChatCompletionResponse::new(
                 MlxService::new_chat_id(),
@@ -148,8 +155,7 @@ async fn stream_response(
     req: ChatCompletionRequest,
     messages: Vec<ChatMessage>,
     max_tokens: usize,
-    temperature: f64,
-    top_p: f64,
+    sampler: SamplerParams,
     chat_template_kwargs: serde_json::Value,
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
@@ -161,7 +167,7 @@ async fn stream_response(
     let timeout = state.config.stream_timeout;
 
     let token_stream = match state.mlx.generate_stream(
-        messages, max_tokens, temperature, top_p, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name,
+        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),

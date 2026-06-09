@@ -71,6 +71,19 @@ pub struct Usage {
     pub total_tokens: usize,
 }
 
+/// Sampling parameters threaded through all generation calls.
+#[derive(Debug, Clone, Default)]
+pub struct SamplerParams {
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: Option<i64>,
+    pub min_p: Option<f64>,
+    pub repetition_penalty: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    pub frequency_penalty: Option<f64>,
+    pub num_draft_tokens: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum StopSequence {
@@ -94,9 +107,13 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<i64>,
+    pub min_p: Option<f64>,
     pub stream: Option<bool>,
     pub frequency_penalty: Option<f64>,
     pub presence_penalty: Option<f64>,
+    pub repetition_penalty: Option<f64>,
+    pub num_draft_tokens: Option<usize>,
     pub stop: Option<StopSequence>,
     pub n: Option<u32>,
     pub response_format: Option<ResponseFormat>,
@@ -204,7 +221,10 @@ pub struct CompletionRequest {
     pub max_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<i64>,
+    pub min_p: Option<f64>,
     pub stream: Option<bool>,
+    pub repetition_penalty: Option<f64>,
     pub stop: Option<StopSequence>,
     pub suffix: Option<String>,
     pub n: Option<u32>,

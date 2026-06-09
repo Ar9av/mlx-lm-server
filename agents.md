@@ -192,7 +192,74 @@ let result = tokio::task::spawn_blocking(move || {
 - **TTS**: `mlx_audio.tts` — Kokoro model. `model.generate(text, voice=voice, lang_code=lang_code, verbose=False)` returns `(audio_array, sample_rate)`. `lang_code` must be inferred from voice prefix (`af_`/`am_` → `"a"`, `bf_`/`bm_` → `"b"`) — do not rely on system `espeak` binary.
 - **STT**: `mlx_audio.stt` — Whisper family. `model.generate(path, language=lang, temperature=0.0)` returns transcript string.
 - **STS**: `mlx_audio.sts` — SAM-Audio. `model.separate_long([str_path], descriptions=[desc], chunk_seconds=10.0, verbose=False)` returns `[(target_array, sr), (residual_array, sr)]`. Requires 48 kHz input. Needs mixed audio (voice + background) — pure silence has nothing to separate.
-- **LM**: `mlx_lm` — `mlx_lm.load(model_id)` returns `(model, tokenizer)`. Generation via `mlx_lm.generate(model, tokenizer, prompt, max_tokens=N)`.
+- **LM**: `mlx_lm` — `mlx_lm.load(model_id)` returns `(model, tokenizer)`. Sync generation via `mlx_lm.generate(model, tokenizer, prompt, ...)`. Streaming via `mlx_lm.stream_generate(model, tokenizer, prompt, ...)` which yields objects with `.text` attribute. Sampler constructed via `mlx_lm.sample_utils.make_sampler(temp, top_p, top_k, min_p, repetition_penalty)`.
+
+## Sampler parameters (as of mlx-lm v0.31+)
+
+All sampler params are bundled in `SamplerParams` (defined in `mlx-lm-server/src/models.rs`) and flow from request → route handler → `generate_response` / `generate_stream` / `generate_completion` → `make_sampler()` + `generate()` kwargs.
+
+| Rust field | Python target | Notes |
+|---|---|---|
+| `temperature` | `make_sampler(temp=...)` | |
+| `top_p` | `make_sampler(top_p=...)` | |
+| `top_k` | `make_sampler(top_k=...)` | |
+| `min_p` | `make_sampler(min_p=...)` | alternative to top_p |
+| `repetition_penalty` | `make_sampler(repetition_penalty=...)` | |
+| `presence_penalty` | `generate(presence_penalty=...)` | passed directly to generate, not sampler |
+| `frequency_penalty` | `generate(frequency_penalty=...)` | passed directly to generate, not sampler |
+| `num_draft_tokens` | `generate(num_draft_tokens=...)` | only set when draft_model is loaded |
+
+## New mlx-lm features (WWDC 2025 / v0.30–0.31)
+
+**Speculative decoding** — set `drafter` in load request, optionally `num_draft_tokens` (default 3) per chat request. The draft model is stored in `LoadedModel.draft_model`.
+
+**LRU prompt cache** — mlx-lm now has `make_prompt_cache(model)` for multi-turn KV reuse. Not yet wired in this Rust server — to add: store `Py<PyAny>` cache in `LoadedModel`, pass to `generate()` as `prompt_cache=...` kwarg.
+
+**Rotating KV cache** — `--max-kv-size` in mlx-lm server limits KV cache memory for long-context inference. Not yet exposed here.
+
+**New quantization formats** — `mxfp8` and `nvfp4` supported. Mixed-precision via `quant_predicate` callback (e.g. 6-bit embed/head, 4-bit transformer). Use `mlx_lm.convert` with `quant_predicate` arg.
+
+**Tool use / function calling** — models with `has_tool_calling = True` attribute support OpenAI tool-call format. mlx-lm ships per-model parsers (`tool_parsers/`) for Gemma4, Mistral, GLM4.7, Kimi-K2.5, Qwen3-Coder, generic JSON, Pythonic. Tool calls come back in streaming `delta.tool_calls` chunks — the Rust server currently passes tool definitions through `chat_template_kwargs` but does not parse tool call deltas. To add full tool use: detect `tools` in request, pass to `apply_chat_template`, parse `tool_calls` from response.
+
+**Supported models** (as of v0.31): Gemma 4, Qwen 3.5, DeepSeek V3.2, MiniMax M2/M2.5, Kimi-K2.5, LongCat Flash, GLM 4.7/5, Falcon H1, LFM2, RWKV7, NemotronH, + all prior families.
+
+**NAX on M5** (macOS 26.2+) — MLX JIT-compiles to the Neural Accelerator automatically via the Metal backend. No code changes needed; just run on M5 hardware.
+
+## Distributed inference (multi-Mac)
+
+As of mlx-lm v0.30.6, `mlx_lm.server` supports multi-rank distributed inference via `mx.distributed`. The Rust server talks to rank-0 only.
+
+```bash
+# 1. Generate hostfile
+mlx.distributed_config \
+  --hosts mac1.local,mac2.local \
+  --over thunderbolt \          # or: ethernet
+  --backend jaccl \             # or: ring (ethernet), mpi
+  --auto-setup \
+  --output hostfile.json
+
+# 2. Launch
+MLX_METAL_FAST_SYNCH=1 mlx.launch \
+  --backend jaccl \
+  --hostfile hostfile.json \
+  -- python -m mlx_lm.server --model mlx-community/Llama-3.1-70B-Instruct-4bit
+```
+
+**Backend requirements**:
+- `jaccl` (JACCL/Thunderbolt RDMA): macOS 26.2+, `rdma_ctl enable` in Recovery, fully-connected Thunderbolt 5 mesh
+- `ring` (TCP/Ethernet): any macOS, each rank connects to neighbors only
+- Key env vars: `MLX_RANK`, `MLX_JACCL_COORDINATOR`, `MLX_METAL_FAST_SYNCH=1`
+
+**Limitations**: LoRA adapters and draft models are not supported in distributed mode.
+
+**Distributed layers** (for custom model work): `AllToShardedLinear`, `ShardedToAllLinear`, `shard_linear()`, `shard_inplace()`.
+
+## WWDC 2025 references
+
+- [Build local AI agents on Mac with MLX](https://developer.apple.com/videos/play/wwdc2025/) — agentic workflows, OpenCode integration, Xcode, multi-Mac
+- [Explore distributed inference and training with MLX](https://developer.apple.com/videos/play/wwdc2025/) — JACCL/Thunderbolt RDMA, ring backend, distributed layers
+- [Get started with MLX for Apple silicon](https://developer.apple.com/videos/play/wwdc2025/) — `mx.fast.metal_kernel`, `mx.compile`, NAX on M5, Swift parity
+- [Explore large language models on Apple silicon with MLX](https://developer.apple.com/videos/play/wwdc2025/) — DeepSeek V3 on M3 Ultra, mixed quantization, LoRA, Swift LLM app in 28 lines
 
 ## Non-obvious gotchas
 
@@ -201,3 +268,5 @@ let result = tokio::task::spawn_blocking(move || {
 3. **`axum` multipart** is only needed by `mlx-audio-server`. It is declared as `axum = { workspace = true, features = ["multipart"] }` in `mlx-audio-server/Cargo.toml` on top of the workspace base.
 4. **Concurrent model inference is serialised** via `tokio::sync::Semaphore` with `max_concurrent=1` default. MLX models are not thread-safe; do not change this without testing.
 5. **HuggingFace model downloads** use `snapshot_download()` from Python. If a download is interrupted, `.incomplete` blob files may be left in `~/.cache/huggingface/hub/` and the next attempt will fail with `FileNotFoundError`. Delete the `.incomplete` file to recover.
+6. **`presence_penalty` / `frequency_penalty`** go directly to `generate()` kwargs (not `make_sampler`). All other sampling params go through `make_sampler`. This matches mlx-lm's internal split.
+7. **GIL starvation fix** (mlx-lm v0.30.1): `stream_generate` now releases the GIL during generation — safe to call from Rust threads via `spawn_blocking` without starving other async tasks.

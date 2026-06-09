@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::MlxError;
-use crate::models::{ChatMessage, MountedAdapterInfo};
+use crate::models::{ChatMessage, MountedAdapterInfo, SamplerParams};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
@@ -248,8 +248,7 @@ impl MlxService {
         &self,
         prompt: String,
         max_tokens: usize,
-        temperature: f64,
-        top_p: f64,
+        sampler: SamplerParams,
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
         adapter_name: Option<String>,
@@ -262,15 +261,17 @@ impl MlxService {
                 let tokenizer = tokenizer_py.as_ref(py);
                 let prompt_tokens = count_tokens(py, tokenizer, &prompt);
                 let mlx_lm = py.import("mlx_lm")?;
-                let sampler = make_sampler(py, temperature, top_p)?;
+                let py_sampler = make_sampler(py, &sampler)?;
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("prompt", prompt.as_str())?;
                 kwargs.set_item("max_tokens", max_tokens as i64)?;
-                kwargs.set_item("sampler", sampler)?;
+                kwargs.set_item("sampler", py_sampler)?;
                 if let Some(bits) = kv_bits {
                     kwargs.set_item("kv_bits", bits)?;
                     kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
                 }
+                if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
+                if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
                 let response: String = mlx_lm
                     .getattr("generate")?
                     .call((model_py.as_ref(py), tokenizer), Some(kwargs))?
@@ -288,8 +289,7 @@ impl MlxService {
         &self,
         messages: Vec<ChatMessage>,
         max_tokens: usize,
-        temperature: f64,
-        top_p: f64,
+        sampler: SamplerParams,
         chat_template_kwargs: serde_json::Value,
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
@@ -306,19 +306,24 @@ impl MlxService {
                 let prompt_tokens = count_tokens(py, tokenizer, &prompt);
 
                 let mlx_lm = py.import("mlx_lm")?;
-                let sampler = make_sampler(py, temperature, top_p)?;
+                let py_sampler = make_sampler(py, &sampler)?;
 
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("prompt", &prompt)?;
                 kwargs.set_item("max_tokens", max_tokens as i64)?;
-                kwargs.set_item("sampler", sampler)?;
+                kwargs.set_item("sampler", py_sampler)?;
                 if let Some(bits) = kv_bits {
                     kwargs.set_item("kv_bits", bits)?;
                     kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
                 }
                 if let Some(ref draft) = draft_model_py {
                     kwargs.set_item("draft_model", draft.as_ref(py))?;
+                    if let Some(n) = sampler.num_draft_tokens {
+                        kwargs.set_item("num_draft_tokens", n as i64)?;
+                    }
                 }
+                if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
+                if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
                 let response: String = mlx_lm
                     .getattr("generate")?
@@ -340,8 +345,7 @@ impl MlxService {
         &self,
         messages: Vec<ChatMessage>,
         max_tokens: usize,
-        temperature: f64,
-        top_p: f64,
+        sampler: SamplerParams,
         timeout_secs: f64,
         chat_template_kwargs: serde_json::Value,
         kv_bits: Option<u32>,
@@ -361,19 +365,24 @@ impl MlxService {
                         apply_chat_template(py, tokenizer, &windowed, &chat_template_kwargs)?;
 
                     let mlx_lm = py.import("mlx_lm")?;
-                    let sampler = make_sampler(py, temperature, top_p)?;
+                    let py_sampler = make_sampler(py, &sampler)?;
 
                     let kwargs = PyDict::new(py);
                     kwargs.set_item("prompt", &prompt)?;
                     kwargs.set_item("max_tokens", max_tokens as i64)?;
-                    kwargs.set_item("sampler", sampler)?;
+                    kwargs.set_item("sampler", py_sampler)?;
                     if let Some(bits) = kv_bits {
                         kwargs.set_item("kv_bits", bits)?;
                         kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
                     }
                     if let Some(ref draft) = draft_model_py {
                         kwargs.set_item("draft_model", draft.as_ref(py))?;
+                        if let Some(n) = sampler.num_draft_tokens {
+                            kwargs.set_item("num_draft_tokens", n as i64)?;
+                        }
                     }
+                    if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
+                    if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
                     let generator = mlx_lm
                         .getattr("stream_generate")?
@@ -733,10 +742,13 @@ fn apply_chat_template(
     }
 }
 
-fn make_sampler<'py>(py: Python<'py>, temperature: f64, top_p: f64) -> PyResult<&'py PyAny> {
+fn make_sampler<'py>(py: Python<'py>, p: &SamplerParams) -> PyResult<&'py PyAny> {
     let kwargs = PyDict::new(py);
-    kwargs.set_item("temp", temperature)?;
-    kwargs.set_item("top_p", top_p)?;
+    kwargs.set_item("temp", p.temperature)?;
+    kwargs.set_item("top_p", p.top_p)?;
+    if let Some(v) = p.top_k     { kwargs.set_item("top_k", v)?; }
+    if let Some(v) = p.min_p     { kwargs.set_item("min_p", v)?; }
+    if let Some(v) = p.repetition_penalty { kwargs.set_item("repetition_penalty", v)?; }
     py.import("mlx_lm.sample_utils")?
         .getattr("make_sampler")?
         .call((), Some(kwargs))

@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use tracing::info;
 
 use crate::mlx_service::MlxService;
-use crate::models::{CompletionRequest, CompletionResponse, Usage};
+use crate::models::{CompletionRequest, CompletionResponse, SamplerParams, Usage};
 use crate::state::AppState;
 
 pub async fn completions(
@@ -17,8 +17,14 @@ pub async fn completions(
 
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     let max_tokens = req.max_tokens.unwrap_or(state.config.default_max_tokens);
-    let temperature = req.temperature.unwrap_or(state.config.default_temperature);
-    let top_p = req.top_p.unwrap_or(state.config.default_top_p);
+    let sampler = SamplerParams {
+        temperature: req.temperature.unwrap_or(state.config.default_temperature),
+        top_p: req.top_p.unwrap_or(state.config.default_top_p),
+        top_k: req.top_k,
+        min_p: req.min_p,
+        repetition_penalty: req.repetition_penalty,
+        ..Default::default()
+    };
 
     let _permit = match state.inference_sem.clone().acquire_owned().await {
         Ok(p) => p,
@@ -31,8 +37,7 @@ pub async fn completions(
     match state.mlx.generate_completion(
         req.prompt.first().to_string(),
         max_tokens,
-        temperature,
-        top_p,
+        sampler,
         req.kv_bits,
         req.kv_group_size,
         None,

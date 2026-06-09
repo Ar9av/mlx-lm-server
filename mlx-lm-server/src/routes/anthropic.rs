@@ -9,7 +9,7 @@ use futures::StreamExt;
 use tracing::info;
 
 use crate::mlx_service::MlxService;
-use crate::models::{AnthropicRequest, AnthropicResponse, ChatMessage};
+use crate::models::{AnthropicRequest, AnthropicResponse, ChatMessage, SamplerParams};
 use crate::state::AppState;
 
 pub async fn messages(
@@ -58,8 +58,11 @@ pub async fn messages(
 
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     let max_tokens = req.max_tokens;
-    let temperature = req.temperature.unwrap_or(state.config.default_temperature);
-    let top_p = req.top_p.unwrap_or(state.config.default_top_p);
+    let sampler = SamplerParams {
+        temperature: req.temperature.unwrap_or(state.config.default_temperature),
+        top_p: req.top_p.unwrap_or(state.config.default_top_p),
+        ..Default::default()
+    };
     let kv_bits = req.kv_bits;
     let kv_group_size = req.kv_group_size;
     let adapter_name = req.adapter_name.clone();
@@ -71,9 +74,9 @@ pub async fn messages(
     };
 
     if req.stream {
-        stream_messages(state, messages, model_name, max_tokens, temperature, top_p, kv_bits, kv_group_size, adapter_name, _permit).await
+        stream_messages(state, messages, model_name, max_tokens, sampler, kv_bits, kv_group_size, adapter_name, _permit).await
     } else {
-        sync_messages(state, messages, model_name, max_tokens, temperature, top_p, kv_bits, kv_group_size, adapter_name, _permit).await
+        sync_messages(state, messages, model_name, max_tokens, sampler, kv_bits, kv_group_size, adapter_name, _permit).await
     }
 }
 
@@ -82,15 +85,14 @@ async fn sync_messages(
     messages: Vec<ChatMessage>,
     model_name: String,
     max_tokens: usize,
-    temperature: f64,
-    top_p: f64,
+    sampler: SamplerParams,
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
     adapter_name: Option<String>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> axum::response::Response {
     info!("Anthropic sync message for model {}", model_name);
-    match state.mlx.generate_response(messages, max_tokens, temperature, top_p, serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name).await {
+    match state.mlx.generate_response(messages, max_tokens, sampler, serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name).await {
         Ok((content, prompt_tokens, completion_tokens)) => {
             let resp = AnthropicResponse::new(
                 MlxService::new_msg_id(),
@@ -110,8 +112,7 @@ async fn stream_messages(
     messages: Vec<ChatMessage>,
     model_name: String,
     max_tokens: usize,
-    temperature: f64,
-    top_p: f64,
+    sampler: SamplerParams,
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
     adapter_name: Option<String>,
@@ -121,7 +122,7 @@ async fn stream_messages(
     let timeout = state.config.stream_timeout;
 
     let token_stream = match state.mlx.generate_stream(
-        messages, max_tokens, temperature, top_p, timeout,
+        messages, max_tokens, sampler, timeout,
         serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name,
     ).await {
         Ok(s) => s,

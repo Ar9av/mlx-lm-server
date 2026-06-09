@@ -2,8 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use std::time::Instant;
 use tracing::info;
 
-use crate::models::{BenchmarkRequest, BenchmarkResult, MessageContent};
-use crate::models::ChatMessage;
+use crate::models::{BenchmarkRequest, BenchmarkResult, ChatMessage, MessageContent, SamplerParams};
 use crate::state::AppState;
 
 pub async fn run_benchmark(
@@ -19,7 +18,11 @@ pub async fn run_benchmark(
 
     let runs = req.runs.max(1).min(20);
     let max_tokens = req.max_tokens.max(1).min(512);
-    let temperature = req.temperature.unwrap_or(0.0);
+    let sampler = SamplerParams {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_p: 1.0,
+        ..Default::default()
+    };
     let model = state.mlx.current_model().await;
 
     info!("Running benchmark: {} runs, {} max_tokens", runs, max_tokens);
@@ -50,8 +53,7 @@ pub async fn run_benchmark(
         match state.mlx.generate_stream(
             messages.clone(),
             max_tokens,
-            temperature,
-            1.0,
+            sampler.clone(),
             60.0,
             serde_json::Value::Object(Default::default()),
             None,
