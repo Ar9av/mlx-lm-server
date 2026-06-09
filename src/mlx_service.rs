@@ -404,6 +404,95 @@ impl MlxService {
         Ok(ReceiverStream::new(rx))
     }
 
+    pub async fn generate_vision_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        image_urls: Vec<String>,
+        max_tokens: usize,
+        temperature: f64,
+        top_p: f64,
+    ) -> Result<(String, usize, usize), MlxError> {
+        let model_id = self.current_model().await.ok_or(MlxError::NotLoaded)?;
+        let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
+        let text_prompt = messages.iter()
+            .map(|m| format!("{}: {}", m.role, m.content.as_text()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<(String, usize, usize)> {
+                let mlx_vlm = py.import("mlx_vlm").map_err(|e| {
+                    pyo3::exceptions::PyImportError::new_err(format!(
+                        "mlx_vlm not installed (pip install mlx-vlm): {}", e
+                    ))
+                })?;
+
+                let load_result = mlx_vlm.getattr("load")?.call1((&model_id,))?;
+                let model = load_result.get_item(0)?;
+                let processor = load_result.get_item(1)?;
+
+                // Load images via PIL
+                let pil = py.import("PIL.Image")?;
+                let io_mod = py.import("io")?;
+                let base64_mod = py.import("base64")?;
+                let urllib = py.import("urllib.request")?;
+
+                let mut pil_images: Vec<&PyAny> = Vec::new();
+                for url in &image_urls {
+                    let img = if url.starts_with("data:") {
+                        let parts: Vec<&str> = url.splitn(2, ',').collect();
+                        let data = parts.get(1).unwrap_or(&"");
+                        let img_bytes = base64_mod.call_method1("b64decode", (*data,))?;
+                        let buf = io_mod.call_method1("BytesIO", (img_bytes,))?;
+                        pil.call_method1("open", (buf,))?
+                    } else {
+                        let resp = urllib.call_method1("urlopen", (url.as_str(),))?;
+                        let data = resp.call_method0("read")?;
+                        let buf = io_mod.call_method1("BytesIO", (data,))?;
+                        pil.call_method1("open", (buf,))?
+                    };
+                    pil_images.push(img);
+                }
+
+                // Apply vision chat template
+                let prompt_utils = mlx_vlm.getattr("prompt_utils")?;
+                let tpl_kwargs = PyDict::new(py);
+                tpl_kwargs.set_item("num_images", pil_images.len())?;
+                let formatted: String = prompt_utils
+                    .call_method("apply_chat_template", (processor, &text_prompt), Some(tpl_kwargs))?
+                    .extract()?;
+
+                // Generate
+                let gen_kwargs = PyDict::new(py);
+                gen_kwargs.set_item("max_tokens", max_tokens as i64)?;
+                gen_kwargs.set_item("temp", temperature)?;
+                gen_kwargs.set_item("top_p", top_p)?;
+                let image_arg = if pil_images.len() == 1 {
+                    pil_images[0].into_py(py)
+                } else {
+                    pyo3::types::PyList::new(py, &pil_images).into()
+                };
+                let response: String = mlx_vlm
+                    .call_method("generate", (model, processor, &formatted, image_arg), Some(gen_kwargs))?
+                    .extract()?;
+
+                Ok((response, 0, 0))
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| {
+            let msg = e.to_string();
+            if msg.contains("mlx_vlm not installed") || msg.contains("No module named") {
+                MlxError::VisionNotAvailable(
+                    "mlx_vlm not installed. Run: pip install mlx-vlm".into()
+                )
+            } else {
+                MlxError::Python(msg)
+            }
+        })
+    }
+
     async fn get_model_refs(&self) -> Result<(Py<PyAny>, Py<PyAny>, Option<Py<PyAny>>), MlxError> {
         self.get_model_refs_for(None).await
     }
@@ -525,11 +614,11 @@ fn prepare_messages(messages: &[ChatMessage]) -> Vec<HashMap<String, String>> {
 
     for msg in messages {
         if msg.role == "system" {
-            system_parts.push(msg.content.clone());
+            system_parts.push(msg.content.as_text());
         } else {
             let mut m = HashMap::new();
             m.insert("role".into(), msg.role.clone());
-            m.insert("content".into(), msg.content.clone());
+            m.insert("content".into(), msg.content.as_text());
             rest.push(m);
         }
     }
@@ -557,7 +646,7 @@ fn apply_sliding_window(
 
     let total: usize = non_system
         .iter()
-        .map(|m| count_tokens(py, tokenizer, &m.content))
+        .map(|m| count_tokens(py, tokenizer, &m.content.as_text()))
         .sum();
 
     if total <= max_tokens {
@@ -569,7 +658,7 @@ fn apply_sliding_window(
     let mut kept: Vec<ChatMessage> = Vec::new();
     let mut used = 0usize;
     for msg in non_system.iter().rev() {
-        let t = count_tokens(py, tokenizer, &msg.content);
+        let t = count_tokens(py, tokenizer, &msg.content.as_text());
         if used + t > max_tokens {
             break;
         }

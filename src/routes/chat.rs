@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::error::MlxError;
 use crate::mlx_service::{MlxService, MAX_MESSAGE_TOKENS};
-use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, TokenizeRequest, TokenizeResponse, Usage};
+use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent, TokenizeRequest, TokenizeResponse, Usage};
 use crate::state::AppState;
 
 pub async fn chat_completions(
@@ -23,7 +23,37 @@ pub async fn chat_completions(
         }
     }
 
-    let total_chars: usize = req.messages.iter().map(|m| m.content.len()).sum();
+    let total_chars: usize = req.messages.iter().map(|m| m.content.as_text().len()).sum();
+
+    // Check for image content — route to vision handler
+    let all_image_urls: Vec<String> = req.messages.iter()
+        .flat_map(|m| m.content.image_urls())
+        .collect();
+    if !all_image_urls.is_empty() {
+        let max_tokens = req.max_tokens.unwrap_or(state.config.default_max_tokens);
+        let temperature = req.temperature.unwrap_or(state.config.default_temperature);
+        let top_p = req.top_p.unwrap_or(state.config.default_top_p);
+        let _permit = match state.inference_sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),
+        };
+        return match state.mlx.generate_vision_response(
+            req.messages.clone(), all_image_urls, max_tokens, temperature, top_p,
+        ).await {
+            Ok((content, prompt_tokens, completion_tokens)) => {
+                let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
+                let resp = ChatCompletionResponse::new(
+                    MlxService::new_chat_id(),
+                    model_name,
+                    content,
+                    crate::models::Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
+                );
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+            Err(e) => e.into_response(),
+        };
+    }
     if total_chars / 4 > MAX_MESSAGE_TOKENS {
         return MlxError::TokenLimit(format!(
             "estimated {} tokens exceeds maximum {}", total_chars / 4, MAX_MESSAGE_TOKENS
@@ -36,9 +66,10 @@ pub async fn chat_completions(
         if rf.kind == "json_object" {
             let instruction = "You must respond with valid JSON only. Do not include any text before or after the JSON object.".to_string();
             if let Some(first_sys) = messages.iter_mut().find(|m| m.role == "system") {
-                first_sys.content = format!("{}\n\n{}", first_sys.content, instruction);
+                let existing = first_sys.content.as_text();
+                first_sys.content = MessageContent::Text(format!("{}\n\n{}", existing, instruction));
             } else {
-                messages.insert(0, ChatMessage { role: "system".into(), content: instruction });
+                messages.insert(0, ChatMessage { role: "system".into(), content: MessageContent::Text(instruction) });
             }
         } else if rf.kind == "json_schema" {
             let schema_hint = rf.json_schema.as_ref()
@@ -50,9 +81,10 @@ pub async fn chat_completions(
                 schema_hint
             );
             if let Some(first_sys) = messages.iter_mut().find(|m| m.role == "system") {
-                first_sys.content = format!("{}\n\n{}", first_sys.content, instruction);
+                let existing = first_sys.content.as_text();
+                first_sys.content = MessageContent::Text(format!("{}\n\n{}", existing, instruction));
             } else {
-                messages.insert(0, ChatMessage { role: "system".into(), content: instruction });
+                messages.insert(0, ChatMessage { role: "system".into(), content: MessageContent::Text(instruction) });
             }
         }
     }
