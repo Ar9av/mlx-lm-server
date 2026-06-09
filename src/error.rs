@@ -26,6 +26,9 @@ pub enum MlxError {
     #[error("Adapter '{0}' is not mounted")]
     AdapterNotFound(String),
 
+    #[error("Vision not available: {0}")]
+    VisionNotAvailable(String),
+
     #[error("Streaming timed out")]
     Timeout,
 
@@ -55,6 +58,9 @@ impl IntoResponse for MlxError {
             }
             MlxError::AdapterNotFound(_) => {
                 (StatusCode::NOT_FOUND, "adapter_not_found", self.to_string())
+            }
+            MlxError::VisionNotAvailable(_) => {
+                (StatusCode::NOT_IMPLEMENTED, "vision_not_available", self.to_string())
             }
             MlxError::TokenLimit(_) => (
                 StatusCode::BAD_REQUEST,

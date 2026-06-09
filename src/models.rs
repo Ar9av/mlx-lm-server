@@ -10,10 +10,58 @@ fn now_secs() -> u64 {
 
 // ── Shared ────────────────────────────────────────────────────────────────────
 
+/// Per-part content for multimodal messages
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: Option<String>,
+    pub image_url: Option<ImageUrlRef>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ImageUrlRef {
+    pub url: String,
+}
+
+/// Either a plain text string or an array of typed content parts
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    pub fn as_text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts.iter()
+                .filter_map(|p| if p.kind == "text" { p.text.as_deref() } else { None })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    pub fn image_urls(&self) -> Vec<String> {
+        match self {
+            MessageContent::Text(_) => vec![],
+            MessageContent::Parts(parts) => parts.iter()
+                .filter(|p| p.kind == "image_url")
+                .filter_map(|p| p.image_url.as_ref().map(|u| u.url.clone()))
+                .collect(),
+        }
+    }
+
+    pub fn has_images(&self) -> bool {
+        !self.image_urls().is_empty()
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -78,7 +126,7 @@ impl ChatCompletionResponse {
             model,
             choices: vec![ChatCompletionChoice {
                 index: 0,
-                message: ChatMessage { role: "assistant".into(), content },
+                message: ChatMessage { role: "assistant".into(), content: MessageContent::Text(content) },
                 finish_reason: Some("stop".into()),
             }],
             usage,
@@ -284,19 +332,39 @@ impl AnthropicContent {
         match self {
             AnthropicContent::Text(s) => s.clone(),
             AnthropicContent::Blocks(blocks) => blocks.iter()
-                .filter_map(|b| if b.kind == "text" { Some(b.text.as_str()) } else { None })
+                .filter_map(|b| if b.kind == "text" { b.text.as_deref() } else { None })
                 .collect::<Vec<_>>()
                 .join(""),
         }
     }
+
+    pub fn image_urls(&self) -> Vec<String> {
+        match self {
+            AnthropicContent::Text(_) => vec![],
+            AnthropicContent::Blocks(blocks) => blocks.iter()
+                .filter(|b| b.kind == "image")
+                .filter_map(|b| b.source.as_ref())
+                .filter_map(|s| s.url.clone())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ContentBlockSource {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub url: Option<String>,
+    pub data: Option<String>,
+    pub media_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ContentBlock {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default)]
-    pub text: String,
+    pub text: Option<String>,
+    pub source: Option<ContentBlockSource>,
 }
 
 #[derive(Debug, Serialize)]
@@ -318,7 +386,7 @@ impl AnthropicResponse {
             id,
             kind: "message",
             role: "assistant",
-            content: vec![ContentBlock { kind: "text".into(), text }],
+            content: vec![ContentBlock { kind: "text".into(), text: Some(text), source: None }],
             model,
             stop_reason: Some("end_turn".into()),
             stop_sequence: None,

@@ -22,13 +22,38 @@ pub async fn messages(
         }
     }
 
+    use crate::models::MessageContent;
     // Convert Anthropic messages → internal ChatMessage format
     let mut messages: Vec<ChatMessage> = Vec::new();
+    let mut image_urls: Vec<String> = Vec::new();
     if let Some(sys) = &req.system {
-        messages.push(ChatMessage { role: "system".into(), content: sys.clone() });
+        messages.push(ChatMessage { role: "system".into(), content: MessageContent::Text(sys.clone()) });
     }
     for m in &req.messages {
-        messages.push(ChatMessage { role: m.role.clone(), content: m.content.as_text() });
+        image_urls.extend(m.content.image_urls());
+        messages.push(ChatMessage { role: m.role.clone(), content: MessageContent::Text(m.content.as_text()) });
+    }
+
+    // If images present, route to vision handler
+    if !image_urls.is_empty() {
+        let max_tokens = req.max_tokens;
+        let temperature = req.temperature.unwrap_or(state.config.default_temperature);
+        let top_p = req.top_p.unwrap_or(state.config.default_top_p);
+        let _permit = match state.inference_sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),
+        };
+        let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
+        return match state.mlx.generate_vision_response(messages, image_urls, max_tokens, temperature, top_p).await {
+            Ok((content, pt, ct)) => {
+                let resp = crate::models::AnthropicResponse::new(
+                    crate::mlx_service::MlxService::new_msg_id(), model_name, content, pt, ct,
+                );
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+            Err(e) => e.into_response(),
+        };
     }
 
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
