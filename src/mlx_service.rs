@@ -5,13 +5,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn, error};
 use uuid::Uuid;
 
-pub const MAX_TOKEN_LIMIT: usize = 4096;
+pub const MAX_TOKEN_LIMIT: usize = 32768;
 pub const MAX_WINDOW_TOKENS: usize = 3000;
 pub const MAX_MESSAGE_TOKENS: usize = 4096;
 
@@ -19,6 +19,8 @@ struct LoadedModel {
     model: Py<PyAny>,
     tokenizer: Py<PyAny>,
     model_id: String,
+    loaded_at: Instant,
+    loaded_at_unix: u64,
 }
 
 struct Inner {
@@ -47,7 +49,15 @@ impl MlxService {
         self.inner.lock().await.loaded.is_some()
     }
 
-    pub async fn load_model(&self, model_id: String) -> Result<(), MlxError> {
+    pub async fn ps_info(&self) -> Option<(String, u64, f64)> {
+        let guard = self.inner.lock().await;
+        guard.loaded.as_ref().map(|l| {
+            let rss = process_rss_mb();
+            (l.model_id.clone(), l.loaded_at_unix, rss)
+        })
+    }
+
+    pub async fn load_model(&self, model_id: String, adapter: Option<String>) -> Result<(), MlxError> {
         {
             let guard = self.inner.lock().await;
             if guard.loaded.as_ref().map(|l| l.model_id == model_id).unwrap_or(false) {
@@ -69,12 +79,16 @@ impl MlxService {
             check_model_size(&model_id, max_gb).await?;
         }
 
-        info!("Loading model: {}", model_id);
+        info!("Loading model: {} (adapter: {:?})", model_id, adapter);
         let mid = model_id.clone();
         let (model_py, tokenizer_py) = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<(PyObject, PyObject)> {
                 let mlx_lm = py.import("mlx_lm")?;
-                let result = mlx_lm.getattr("load")?.call1((&mid,))?;
+                let kwargs = PyDict::new(py);
+                if let Some(path) = &adapter {
+                    kwargs.set_item("adapter_path", path.as_str())?;
+                }
+                let result = mlx_lm.getattr("load")?.call((&mid,), Some(kwargs))?;
                 let model: PyObject = result.get_item(0)?.into();
                 let tokenizer: PyObject = result.get_item(1)?.into();
                 Ok((model, tokenizer))
@@ -84,11 +98,18 @@ impl MlxService {
         .map_err(|e| MlxError::LoadFailed(e.to_string()))?
         .map_err(|e: PyErr| MlxError::LoadFailed(e.to_string()))?;
 
+        let loaded_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let mut guard = self.inner.lock().await;
         guard.loaded = Some(LoadedModel {
             model: model_py,
             tokenizer: tokenizer_py,
             model_id,
+            loaded_at: Instant::now(),
+            loaded_at_unix,
         });
         info!("Model loaded successfully");
         Ok(())
@@ -110,6 +131,100 @@ impl MlxService {
         } else {
             None
         }
+    }
+
+    pub async fn tokenize(&self, text: String) -> Result<Vec<i64>, MlxError> {
+        let (_, tokenizer_py) = self.get_model_refs().await?;
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<Vec<i64>> {
+                tokenizer_py.as_ref(py).call_method1("encode", (text.as_str(),))?.extract()
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))
+    }
+
+    pub async fn get_embeddings(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MlxError> {
+        let (model_py, tokenizer_py) = self.get_model_refs().await?;
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<Vec<Vec<f32>>> {
+                let model = model_py.as_ref(py);
+                let tokenizer = tokenizer_py.as_ref(py);
+                let mx = py.import("mlx.core")?;
+
+                // Find the embedding layer (handles LLaMA/Mistral/GPT-2 architectures)
+                let embed_layer = ["embed_tokens", "embedding", "wte"]
+                    .iter()
+                    .find_map(|attr: &&str| {
+                        model.getattr("model").ok()
+                            .and_then(|m| m.getattr(*attr).ok())
+                            .or_else(|| model.getattr(*attr).ok())
+                    })
+                    .ok_or_else(|| pyo3::exceptions::PyAttributeError::new_err(
+                        "Cannot find embedding layer; model must have embed_tokens, embedding, or wte",
+                    ))?;
+
+                let mut results = Vec::new();
+                for text in &texts {
+                    let tokens: Vec<i64> = tokenizer.call_method1("encode", (text.as_str(),))?.extract()?;
+                    let input_ids = mx.call_method1("array", (vec![tokens],))?;
+                    let embeds = embed_layer.call1((input_ids,))?; // [1, seq, dim]
+
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("axis", 1)?;
+                    let pooled = mx.call_method("mean", (embeds,), Some(kwargs))?; // [1, dim]
+                    mx.call_method1("eval", (pooled,))?;
+
+                    let rows: Vec<Vec<f32>> = pooled.call_method0("tolist")?.extract()?;
+                    let mut emb = rows.into_iter().next().unwrap_or_default();
+
+                    // L2 normalize
+                    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        emb.iter_mut().for_each(|x| *x /= norm);
+                    }
+                    results.push(emb);
+                }
+                Ok(results)
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))
+    }
+
+    pub async fn generate_completion(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+        temperature: f64,
+        top_p: f64,
+    ) -> Result<(String, usize, usize), MlxError> {
+        let (model_py, tokenizer_py) = self.get_model_refs().await?;
+        let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
+
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<(String, usize, usize)> {
+                let tokenizer = tokenizer_py.as_ref(py);
+                let prompt_tokens = count_tokens(py, tokenizer, &prompt);
+                let mlx_lm = py.import("mlx_lm")?;
+                let sampler = make_sampler(py, temperature, top_p)?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("prompt", prompt.as_str())?;
+                kwargs.set_item("max_tokens", max_tokens as i64)?;
+                kwargs.set_item("sampler", sampler)?;
+                let response: String = mlx_lm
+                    .getattr("generate")?
+                    .call((model_py.as_ref(py), tokenizer), Some(kwargs))?
+                    .extract()?;
+                let completion_tokens = count_tokens(py, tokenizer, &response);
+                Ok((response, prompt_tokens, completion_tokens))
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))
     }
 
     pub async fn generate_response(
@@ -224,9 +339,25 @@ impl MlxService {
     pub fn new_chat_id() -> String {
         format!("chatcmpl-{}", &Uuid::new_v4().to_string().replace('-', "")[..12])
     }
+
+    pub fn new_msg_id() -> String {
+        format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24])
+    }
 }
 
-// ── Pure helpers (called inside spawn_blocking / with_gil) ───────────────────
+// ── Pure helpers ─────────────────────────────────────────────────────────────
+
+pub fn process_rss_mb() -> f64 {
+    let pid = std::process::id();
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|rss| rss as f64 / 1024.0)
+        .unwrap_or(0.0)
+}
 
 fn prepare_messages(messages: &[ChatMessage]) -> Vec<HashMap<String, String>> {
     let mut system_parts: Vec<String> = Vec::new();

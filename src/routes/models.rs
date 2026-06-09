@@ -7,18 +7,30 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::env;
+use std::path::PathBuf;
 use tokio::fs;
 use tracing::warn;
 
-use crate::models::{HfModel, LocalModel, ModelList, ModelLoadRequest, ModelObject, QuantizationInfo};
+use crate::mlx_service::process_rss_mb;
+use crate::models::{HfModel, LocalModel, ModelList, ModelLoadRequest, ModelObject, PsResponse, QuantizationInfo};
 use crate::state::AppState;
 
+// ── /v1/models — returns all locally cached models (loaded model marked) ─────
+
 pub async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
-    let mut data = Vec::new();
-    if let Some(id) = state.mlx.current_model().await {
-        data.push(ModelObject::new(id));
+    let loaded = state.mlx.current_model().await;
+    let local = scan_local_models().await;
+    let mut data: Vec<ModelObject> = local.iter().map(|m| ModelObject::new(m.id.clone())).collect();
+
+    // Ensure loaded model is at the top, add it if not in cache
+    if let Some(ref id) = loaded {
+        if !data.iter().any(|m| &m.id == id) {
+            data.insert(0, ModelObject::new(id.clone()));
+        } else {
+            data.retain(|m| &m.id != id);
+            data.insert(0, ModelObject::new(id.clone()));
+        }
     }
     Json(ModelList::new(data))
 }
@@ -27,7 +39,7 @@ pub async fn load_model(
     State(state): State<AppState>,
     Json(req): Json<ModelLoadRequest>,
 ) -> impl IntoResponse {
-    match state.mlx.load_model(req.model.clone()).await {
+    match state.mlx.load_model(req.model.clone(), req.adapter).await {
         Ok(_) => (StatusCode::OK, Json(json!(ModelObject::new(req.model)))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -51,9 +63,23 @@ pub async fn unload_model(
                     "code": "model_not_found"
                 }
             })),
-        )
-            .into_response(),
+        ).into_response(),
     }
+}
+
+// ── /api/ps ───────────────────────────────────────────────────────────────────
+
+pub async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
+    let (model, loaded_at) = match state.mlx.ps_info().await {
+        Some((m, ts, _)) => (Some(m), Some(ts)),
+        None => (None, None),
+    };
+    Json(PsResponse {
+        model,
+        loaded_at,
+        memory_mb: process_rss_mb(),
+        pid: std::process::id(),
+    })
 }
 
 // ── Local cache ───────────────────────────────────────────────────────────────
@@ -69,7 +95,7 @@ pub async fn list_local_models() -> Json<Vec<LocalModel>> {
     Json(scan_local_models().await)
 }
 
-async fn scan_local_models() -> Vec<LocalModel> {
+pub async fn scan_local_models() -> Vec<LocalModel> {
     let cache = hf_cache_dir();
     let mut models = Vec::new();
 
@@ -139,8 +165,7 @@ async fn dir_size(path: &PathBuf) -> u64 {
 }
 
 async fn read_quantization(snap: &PathBuf) -> Option<QuantizationInfo> {
-    let config_path = snap.join("config.json");
-    let data = fs::read_to_string(&config_path).await.ok()?;
+    let data = fs::read_to_string(snap.join("config.json")).await.ok()?;
     let cfg: Value = serde_json::from_str(&data).ok()?;
     let q = cfg.get("quantization").or_else(|| cfg.get("quantization_config"))?;
     Some(QuantizationInfo {
@@ -156,24 +181,12 @@ pub async fn delete_local_model(
     let model_path = hf_cache_dir().join(&dir_name);
 
     if !model_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Model not found in cache" })),
-        )
-            .into_response();
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Model not found in cache" }))).into_response();
     }
 
     match tokio::fs::remove_dir_all(&model_path).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(json!({ "status": "ok", "deleted": format!("{}/{}", org, model) })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(_) => (StatusCode::OK, Json(json!({ "status": "ok", "deleted": format!("{}/{}", org, model) }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     }
 }
 
@@ -187,21 +200,13 @@ pub struct HfSearchQuery {
     pub limit: usize,
 }
 
-fn default_limit() -> usize {
-    20
-}
+fn default_limit() -> usize { 20 }
 
-pub async fn search_hf_models(
-    Query(q): Query<HfSearchQuery>,
-) -> impl IntoResponse {
+pub async fn search_hf_models(Query(q): Query<HfSearchQuery>) -> impl IntoResponse {
     let limit = q.limit.min(50);
-    let local_ids: HashSet<String> = scan_local_models()
-        .await
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
-
+    let local_ids: HashSet<String> = scan_local_models().await.into_iter().map(|m| m.id).collect();
     let client = reqwest::Client::new();
+
     let mut params = vec![
         ("author", "mlx-community".to_string()),
         ("sort", "downloads".to_string()),
@@ -210,85 +215,54 @@ pub async fn search_hf_models(
         ("full", "true".to_string()),
     ];
     if !q.search.is_empty() {
-        params.push(("search", q.search.clone()));
+        params.push(("search", q.search));
     }
 
-    let resp = match client
-        .get("https://huggingface.co/api/models")
+    let resp = match client.get("https://huggingface.co/api/models")
         .query(&params)
         .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
+        .send().await
     {
         Ok(r) => r,
         Err(e) => {
             warn!("HuggingFace API unreachable: {}", e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": format!("Failed to reach HuggingFace: {}", e) })),
-            )
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("Failed to reach HuggingFace: {}", e) }))).into_response();
         }
     };
 
     let data: Vec<Value> = match resp.json().await {
         Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
-        }
+        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
     };
 
-    let mut models: Vec<HfModel> = data
-        .iter()
-        .map(|item| {
-            let id = item["id"].as_str().unwrap_or("").to_string();
-            HfModel {
-                model_id: id.clone(),
-                pipeline_tag: item["pipeline_tag"].as_str().unwrap_or("").to_string(),
-                downloads: item["downloads"].as_u64().unwrap_or(0),
-                likes: item["likes"].as_u64().unwrap_or(0),
-                size_bytes: item["usedStorage"].as_u64(),
-                cached: local_ids.contains(&id),
-                id,
-            }
-        })
-        .collect();
+    let mut models: Vec<HfModel> = data.iter().map(|item| {
+        let id = item["id"].as_str().unwrap_or("").to_string();
+        HfModel {
+            model_id: id.clone(),
+            pipeline_tag: item["pipeline_tag"].as_str().unwrap_or("").to_string(),
+            downloads: item["downloads"].as_u64().unwrap_or(0),
+            likes: item["likes"].as_u64().unwrap_or(0),
+            size_bytes: item["usedStorage"].as_u64(),
+            cached: local_ids.contains(&id),
+            id,
+        }
+    }).collect();
 
     // Enrich missing sizes concurrently
-    let needs_size: Vec<String> = models
-        .iter()
-        .filter(|m| m.size_bytes.is_none())
-        .map(|m| m.id.clone())
-        .collect();
-
+    let needs_size: Vec<String> = models.iter().filter(|m| m.size_bytes.is_none()).map(|m| m.id.clone()).collect();
     if !needs_size.is_empty() {
-        let client2 = client.clone();
-        let size_futures: Vec<_> = needs_size
-            .iter()
-            .map(|mid| {
-                let c = client2.clone();
-                let id = mid.clone();
-                async move {
-                    let url = format!("https://huggingface.co/api/models/{}", id);
-                    let resp: Option<Value> = c
-                        .get(&url)
-                        .timeout(std::time::Duration::from_secs(5))
-                        .send()
-                        .await
-                        .ok()
-                        .and_then(|r| futures::executor::block_on(r.json()).ok());
-                    let size = resp.as_ref().and_then(|v| v["usedStorage"].as_u64());
-                    (id, size)
-                }
-            })
-            .collect();
-
-        let sizes: Vec<(String, Option<u64>)> = futures::future::join_all(size_futures).await;
-        let size_map: std::collections::HashMap<String, Option<u64>> = sizes.into_iter().collect();
+        let size_futures: Vec<_> = needs_size.iter().map(|mid| {
+            let c = client.clone();
+            let id = mid.clone();
+            async move {
+                let url = format!("https://huggingface.co/api/models/{}", id);
+                let size = c.get(&url).timeout(std::time::Duration::from_secs(5)).send().await.ok()
+                    .and_then(|r| futures::executor::block_on(r.json::<Value>()).ok())
+                    .and_then(|v| v["usedStorage"].as_u64());
+                (id, size)
+            }
+        }).collect();
+        let size_map: std::collections::HashMap<_, _> = futures::future::join_all(size_futures).await.into_iter().collect();
         for m in &mut models {
             if m.size_bytes.is_none() {
                 m.size_bytes = *size_map.get(&m.id).unwrap_or(&None);

@@ -14,6 +14,7 @@ pub struct Config {
     pub port: u16,
     pub cors_origins: Vec<String>,
     pub stream_timeout: f64,
+    pub max_concurrent: usize,
 }
 
 impl Config {
@@ -37,6 +38,7 @@ impl Config {
                 &["http://localhost:5173", "http://localhost:3000"],
             ),
             stream_timeout: env_f64("MLX_STREAM_TIMEOUT", 120.0),
+            max_concurrent: env_usize("MLX_MAX_CONCURRENT", 1),
         }
     }
 }

@@ -1,0 +1,171 @@
+use axum::{
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+    Json,
+};
+use bytes::Bytes;
+use futures::StreamExt;
+use tracing::info;
+
+use crate::mlx_service::MlxService;
+use crate::models::{AnthropicRequest, AnthropicResponse, ChatMessage};
+use crate::state::AppState;
+
+pub async fn messages(
+    State(state): State<AppState>,
+    Json(req): Json<AnthropicRequest>,
+) -> impl IntoResponse {
+    if !state.mlx.is_loaded().await {
+        if let Err(e) = state.mlx.load_model(req.model.clone(), None).await {
+            return e.into_response();
+        }
+    }
+
+    // Convert Anthropic messages → internal ChatMessage format
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    if let Some(sys) = &req.system {
+        messages.push(ChatMessage { role: "system".into(), content: sys.clone() });
+    }
+    for m in &req.messages {
+        messages.push(ChatMessage { role: m.role.clone(), content: m.content.as_text() });
+    }
+
+    let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
+    let max_tokens = req.max_tokens;
+    let temperature = req.temperature.unwrap_or(state.config.default_temperature);
+    let top_p = req.top_p.unwrap_or(state.config.default_top_p);
+
+    let _permit = match state.inference_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),
+    };
+
+    if req.stream {
+        stream_messages(state, messages, model_name, max_tokens, temperature, top_p, _permit).await
+    } else {
+        sync_messages(state, messages, model_name, max_tokens, temperature, top_p, _permit).await
+    }
+}
+
+async fn sync_messages(
+    state: AppState,
+    messages: Vec<ChatMessage>,
+    model_name: String,
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) -> axum::response::Response {
+    info!("Anthropic sync message for model {}", model_name);
+    match state.mlx.generate_response(messages, max_tokens, temperature, top_p, serde_json::Value::Object(Default::default())).await {
+        Ok((content, prompt_tokens, completion_tokens)) => {
+            let resp = AnthropicResponse::new(
+                MlxService::new_msg_id(),
+                model_name,
+                content,
+                prompt_tokens,
+                completion_tokens,
+            );
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn stream_messages(
+    state: AppState,
+    messages: Vec<ChatMessage>,
+    model_name: String,
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> axum::response::Response {
+    let msg_id = MlxService::new_msg_id();
+    let timeout = state.config.stream_timeout;
+
+    let token_stream = match state.mlx.generate_stream(
+        messages, max_tokens, temperature, top_p, timeout,
+        serde_json::Value::Object(Default::default()),
+    ).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+
+    let msg_id_clone = msg_id.clone();
+    let model_clone = model_name.clone();
+    let mut input_tokens = 0usize;
+    let mut output_tokens = 0usize;
+
+    // Anthropic SSE events
+    let start_event = format!(
+        "event: message_start\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model_name,
+                "stop_reason": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        })
+    );
+    let block_start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+    let ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+    let delta_stream = token_stream.map(move |result| -> Result<Bytes, std::io::Error> {
+        let data = match result {
+            Ok(token) => {
+                output_tokens += 1;
+                format!(
+                    "event: content_block_delta\ndata: {}\n\n",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": token}
+                    })
+                )
+            }
+            Err(e) => format!(
+                "event: error\ndata: {}\n\n",
+                serde_json::json!({"type": "error", "error": {"type": "server_error", "message": e.to_string()}})
+            ),
+        };
+        Ok(Bytes::from(data))
+    });
+
+    let finish_events = format!(
+        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: message_delta\ndata: {}\n\n\
+         event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": output_tokens}
+        })
+    );
+
+    let preamble = futures::stream::iter([
+        Ok::<Bytes, std::io::Error>(Bytes::from(start_event)),
+        Ok(Bytes::from(block_start)),
+        Ok(Bytes::from(ping)),
+    ]);
+
+    let combined = preamble
+        .chain(delta_stream)
+        .chain(futures::stream::once(async move {
+            drop(permit);
+            Ok::<Bytes, std::io::Error>(Bytes::from(finish_events))
+        }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
+    headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+    (headers, axum::body::Body::from_stream(combined)).into_response()
+}
