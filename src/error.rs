@@ -20,6 +20,9 @@ pub enum MlxError {
     #[error("Model '{0}' is {1:.1}GB which exceeds max_model_size_gb ({2:.1}GB)")]
     TooLarge(String, f64, f64),
 
+    #[error("Insufficient RAM: model '{0}' needs ~{1:.1}GB but only {2:.1}GB available")]
+    InsufficientRam(String, f64, f64),
+
     #[error("Streaming timed out")]
     Timeout,
 
@@ -41,7 +44,10 @@ impl IntoResponse for MlxError {
                 "model_not_loaded",
                 self.to_string(),
             ),
-            MlxError::LoadFailed(_) | MlxError::NotAllowed(_) | MlxError::TooLarge(..) => {
+            MlxError::LoadFailed(_)
+            | MlxError::NotAllowed(_)
+            | MlxError::TooLarge(..)
+            | MlxError::InsufficientRam(..) => {
                 (StatusCode::BAD_REQUEST, "model_load_error", self.to_string())
             }
             MlxError::TokenLimit(_) => (

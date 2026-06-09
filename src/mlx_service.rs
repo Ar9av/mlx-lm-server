@@ -85,8 +85,26 @@ impl MlxService {
             }
         }
 
-        if let Some(max_gb) = self.config.max_model_size_gb {
-            check_model_size(&model_id, max_gb).await?;
+        let model_size_gb = fetch_model_size_gb(&model_id).await;
+
+        if let Some(size_gb) = model_size_gb {
+            if let Some(max_gb) = self.config.max_model_size_gb {
+                if size_gb > max_gb {
+                    return Err(MlxError::TooLarge(model_id.clone(), size_gb, max_gb));
+                }
+            }
+
+            if let Some(avail_gb) = available_ram_gb() {
+                if size_gb > avail_gb * 0.9 {
+                    warn!(
+                        "Model '{}' needs ~{:.1}GB but only {:.1}GB available — may OOM",
+                        model_id, size_gb, avail_gb
+                    );
+                    if size_gb > avail_gb * 1.5 {
+                        return Err(MlxError::InsufficientRam(model_id.clone(), size_gb, avail_gb));
+                    }
+                }
+            }
         }
 
         info!("Loading model: {} (adapter: {:?}, drafter: {:?})", model_id, adapter, drafter);
@@ -575,27 +593,60 @@ fn json_to_py<'py>(py: Python<'py>, val: &serde_json::Value) -> PyResult<&'py Py
     })
 }
 
-async fn check_model_size(model_id: &str, max_gb: f64) -> Result<(), MlxError> {
+pub fn available_ram_gb() -> Option<f64> {
+    let output = std::process::Command::new("vm_stat").output().ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+
+    let mut page_size = 4096u64;
+    let mut free = 0u64;
+    let mut inactive = 0u64;
+    let mut purgeable = 0u64;
+    let mut speculative = 0u64;
+
+    for line in text.lines() {
+        if line.contains("page size of") {
+            if let Some(s) = line.split_whitespace()
+                .find(|w| w.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|w| w.parse::<u64>().ok())
+            {
+                page_size = s;
+            }
+        } else if line.starts_with("Pages free:") {
+            free = parse_vm_stat_line(line).unwrap_or(0);
+        } else if line.starts_with("Pages inactive:") {
+            inactive = parse_vm_stat_line(line).unwrap_or(0);
+        } else if line.starts_with("Pages purgeable:") {
+            purgeable = parse_vm_stat_line(line).unwrap_or(0);
+        } else if line.starts_with("Pages speculative:") {
+            speculative = parse_vm_stat_line(line).unwrap_or(0);
+        }
+    }
+
+    let available_bytes = (free + inactive + purgeable + speculative) * page_size;
+    Some(available_bytes as f64 / 1_073_741_824.0)
+}
+
+fn parse_vm_stat_line(line: &str) -> Option<u64> {
+    line.split_whitespace()
+        .last()?
+        .trim_end_matches('.')
+        .parse()
+        .ok()
+}
+
+async fn fetch_model_size_gb(model_id: &str) -> Option<f64> {
     let url = format!("https://huggingface.co/api/models/{}", model_id);
     let client = reqwest::Client::new();
-    let resp: serde_json::Value = match client
+    let resp: serde_json::Value = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-    {
-        Ok(r) => match r.json().await {
-            Ok(v) => v,
-            Err(_) => return Ok(()),
-        },
-        Err(_) => return Ok(()),
-    };
-
-    if let Some(bytes) = resp.get("usedStorage").and_then(|v| v.as_f64()) {
-        let size_gb = bytes / (1024.0_f64.powi(3));
-        if size_gb > max_gb {
-            return Err(MlxError::TooLarge(model_id.to_string(), size_gb, max_gb));
-        }
-    }
-    Ok(())
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    resp.get("usedStorage")
+        .and_then(|v| v.as_f64())
+        .map(|b| b / 1_073_741_824.0)
 }
