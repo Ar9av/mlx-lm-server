@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::MlxError;
-use crate::models::ChatMessage;
+use crate::models::{ChatMessage, MountedAdapterInfo};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
@@ -24,8 +24,19 @@ struct LoadedModel {
     draft_model: Option<Py<PyAny>>,
 }
 
+const MAX_MOUNTED_ADAPTERS: usize = 4;
+
+struct MountedAdapter {
+    model: Py<PyAny>,
+    tokenizer: Py<PyAny>,
+    base_model_id: String,
+    adapter_path: String,
+    mounted_at: u64,
+}
+
 struct Inner {
     loaded: Option<LoadedModel>,
+    adapters: HashMap<String, MountedAdapter>,
 }
 
 #[derive(Clone)]
@@ -37,7 +48,7 @@ pub struct MlxService {
 impl MlxService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner { loaded: None })),
+            inner: Arc::new(Mutex::new(Inner { loaded: None, adapters: HashMap::new() })),
             config,
         }
     }
@@ -241,8 +252,9 @@ impl MlxService {
         top_p: f64,
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
+        adapter_name: Option<String>,
     ) -> Result<(String, usize, usize), MlxError> {
-        let (model_py, tokenizer_py, _) = self.get_model_refs().await?;
+        let (model_py, tokenizer_py, _) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         tokio::task::spawn_blocking(move || {
@@ -281,8 +293,9 @@ impl MlxService {
         chat_template_kwargs: serde_json::Value,
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
+        adapter_name: Option<String>,
     ) -> Result<(String, usize, usize), MlxError> {
-        let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs().await?;
+        let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
@@ -333,8 +346,9 @@ impl MlxService {
         chat_template_kwargs: serde_json::Value,
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
+        adapter_name: Option<String>,
     ) -> Result<ReceiverStream<Result<String, MlxError>>, MlxError> {
-        let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs().await?;
+        let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, MlxError>>(64);
 
@@ -391,7 +405,19 @@ impl MlxService {
     }
 
     async fn get_model_refs(&self) -> Result<(Py<PyAny>, Py<PyAny>, Option<Py<PyAny>>), MlxError> {
+        self.get_model_refs_for(None).await
+    }
+
+    async fn get_model_refs_for(
+        &self,
+        adapter_name: Option<&str>,
+    ) -> Result<(Py<PyAny>, Py<PyAny>, Option<Py<PyAny>>), MlxError> {
         let guard = self.inner.lock().await;
+        if let Some(name) = adapter_name {
+            let a = guard.adapters.get(name).ok_or_else(|| MlxError::AdapterNotFound(name.to_string()))?;
+            let (m, t) = Python::with_gil(|py| (a.model.clone_ref(py), a.tokenizer.clone_ref(py)));
+            return Ok((m, t, None));
+        }
         let loaded = guard.loaded.as_ref().ok_or(MlxError::NotLoaded)?;
         let (m, t, d) = Python::with_gil(|py| {
             (
@@ -401,6 +427,73 @@ impl MlxService {
             )
         });
         Ok((m, t, d))
+    }
+
+    pub async fn mount_adapter(
+        &self,
+        name: String,
+        model_id: String,
+        adapter_path: String,
+    ) -> Result<(), MlxError> {
+        {
+            let guard = self.inner.lock().await;
+            if guard.adapters.len() >= MAX_MOUNTED_ADAPTERS && !guard.adapters.contains_key(&name) {
+                return Err(MlxError::LoadFailed(format!(
+                    "Adapter limit ({}) reached; unmount one first",
+                    MAX_MOUNTED_ADAPTERS
+                )));
+            }
+        }
+
+        let mid = model_id.clone();
+        let apath = adapter_path.clone();
+        info!("Mounting adapter '{}' on model '{}' from '{}'", name, mid, apath);
+
+        let (model_py, tokenizer_py) = tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<(PyObject, PyObject)> {
+                let mlx_lm = py.import("mlx_lm")?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("adapter_path", apath.as_str())?;
+                let result = mlx_lm.getattr("load")?.call((&mid,), Some(kwargs))?;
+                let model: PyObject = result.get_item(0)?.into();
+                let tokenizer: PyObject = result.get_item(1)?.into();
+                Ok((model, tokenizer))
+            })
+        })
+        .await
+        .map_err(|e| MlxError::LoadFailed(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::LoadFailed(e.to_string()))?;
+
+        let mounted_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut guard = self.inner.lock().await;
+        guard.adapters.insert(name.clone(), MountedAdapter {
+            model: model_py,
+            tokenizer: tokenizer_py,
+            base_model_id: model_id,
+            adapter_path,
+            mounted_at,
+        });
+        info!("Adapter '{}' mounted", name);
+        Ok(())
+    }
+
+    pub async fn unmount_adapter(&self, name: &str) -> bool {
+        let mut guard = self.inner.lock().await;
+        guard.adapters.remove(name).is_some()
+    }
+
+    pub async fn list_adapters(&self) -> Vec<MountedAdapterInfo> {
+        let guard = self.inner.lock().await;
+        guard.adapters.iter().map(|(name, a)| MountedAdapterInfo {
+            name: name.clone(),
+            base_model: a.base_model_id.clone(),
+            adapter_path: a.adapter_path.clone(),
+            mounted_at: a.mounted_at,
+        }).collect()
     }
 
     pub fn new_chat_id() -> String {

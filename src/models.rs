@@ -56,6 +56,7 @@ pub struct ChatCompletionRequest {
     pub chat_template_kwargs: serde_json::Value,
     pub kv_bits: Option<u32>,
     pub kv_group_size: Option<u32>,
+    pub adapter_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +263,7 @@ pub struct AnthropicRequest {
     pub stop_sequences: Option<Vec<String>>,
     pub kv_bits: Option<u32>,
     pub kv_group_size: Option<u32>,
+    pub adapter_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -396,6 +398,29 @@ pub struct LocalModel {
 pub struct QuantizationInfo {
     pub bits: Option<serde_json::Value>,
     pub group_size: Option<serde_json::Value>,
+}
+
+// ── Adapter management ────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct AdapterMountRequest {
+    pub name: String,
+    pub adapter_path: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MountedAdapterInfo {
+    pub name: String,
+    pub base_model: String,
+    pub adapter_path: String,
+    pub mounted_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdapterListResponse {
+    pub object: &'static str,
+    pub adapters: Vec<MountedAdapterInfo>,
 }
 
 // ── HuggingFace search ────────────────────────────────────────────────────────

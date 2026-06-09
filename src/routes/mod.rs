@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod anthropic;
 pub mod chat;
 pub mod completions;

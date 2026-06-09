@@ -23,6 +23,9 @@ pub enum MlxError {
     #[error("Insufficient RAM: model '{0}' needs ~{1:.1}GB but only {2:.1}GB available")]
     InsufficientRam(String, f64, f64),
 
+    #[error("Adapter '{0}' is not mounted")]
+    AdapterNotFound(String),
+
     #[error("Streaming timed out")]
     Timeout,
 
@@ -49,6 +52,9 @@ impl IntoResponse for MlxError {
             | MlxError::TooLarge(..)
             | MlxError::InsufficientRam(..) => {
                 (StatusCode::BAD_REQUEST, "model_load_error", self.to_string())
+            }
+            MlxError::AdapterNotFound(_) => {
+                (StatusCode::NOT_FOUND, "adapter_not_found", self.to_string())
             }
             MlxError::TokenLimit(_) => (
                 StatusCode::BAD_REQUEST,
