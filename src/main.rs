@@ -85,6 +85,8 @@ async fn main() {
         .route("/api/models/local/:org/*model", delete(routes::models::delete_local_model))
         .route("/api/huggingface/models", get(routes::models::search_hf_models))
         .route("/api/ps", get(routes::models::ps))
+        // Benchmarking
+        .route("/v1/benchmark", post(routes::benchmark::run_benchmark))
         // Middleware
         .layer(middleware::from_fn(request_id_middleware))
         .layer(cors)

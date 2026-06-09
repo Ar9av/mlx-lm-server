@@ -468,6 +468,35 @@ pub struct QuantizationInfo {
     pub group_size: Option<serde_json::Value>,
 }
 
+// ── Benchmark ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct BenchmarkRequest {
+    #[serde(default = "default_bench_prompt")]
+    pub prompt: String,
+    #[serde(default = "default_bench_runs")]
+    pub runs: usize,
+    #[serde(default = "default_bench_max_tokens")]
+    pub max_tokens: usize,
+    pub temperature: Option<f64>,
+}
+
+fn default_bench_prompt() -> String { "Write a short poem about the ocean.".into() }
+fn default_bench_runs() -> usize { 3 }
+fn default_bench_max_tokens() -> usize { 64 }
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkResult {
+    pub model: Option<String>,
+    pub runs: usize,
+    pub max_tokens: usize,
+    pub ttft_ms_p50: f64,
+    pub ttft_ms_p95: f64,
+    pub tokens_per_sec_mean: f64,
+    pub tokens_per_sec_p50: f64,
+    pub total_tokens_generated: usize,
+}
+
 // ── Rich model info ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
