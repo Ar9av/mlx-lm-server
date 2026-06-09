@@ -11,11 +11,13 @@ pub async fn create_transcription(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<TranscriptionResponse>, AudioError> {
-    // Ensure STT model loaded
     if state.audio.stt_model_id().await.is_none() {
         state.audio.load_stt(state.config.default_stt_model.clone()).await?;
     }
 
+    // Keep NamedTempFile alive for the entire handler so the file isn't deleted
+    // before Python reads it.
+    let mut tmp_file: Option<tempfile::NamedTempFile> = None;
     let mut audio_path: Option<String> = None;
     let mut params = TranscriptionParams {
         model: None,
@@ -38,10 +40,8 @@ pub async fn create_transcription(
                     .map_err(|e| AudioError::Internal(e.to_string()))?;
                 tmp.write_all(&bytes)
                     .map_err(|e| AudioError::Internal(e.to_string()))?;
-                let path = tmp.into_temp_path();
-                audio_path = Some(path.to_string_lossy().to_string());
-                // Don't drop path here — keep alive until after transcription
-                // (We transfer ownership into audio_path as String, so file stays on disk until OS cleans tmp)
+                audio_path = Some(tmp.path().to_string_lossy().to_string());
+                tmp_file = Some(tmp); // keep alive
             }
             "model" => {
                 params.model = Some(field.text().await
@@ -86,6 +86,7 @@ pub async fn create_transcription(
         with_segments,
     ).await?;
 
+    drop(tmp_file); // explicit: file deleted after transcription completes
     let segs = if with_segments && !segments.is_empty() { Some(segments) } else { None };
 
     Ok(Json(TranscriptionResponse { text, segments: segs, language, duration: None }))

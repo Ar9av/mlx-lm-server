@@ -19,6 +19,7 @@ pub async fn create_separation(
         return Err(AudioError::StsNotLoaded);
     }
 
+    let mut tmp_file: Option<tempfile::NamedTempFile> = None;
     let mut audio_path: Option<String> = None;
     let mut description = "speech".to_string();
 
@@ -34,8 +35,8 @@ pub async fn create_separation(
                     .map_err(|e| AudioError::Internal(e.to_string()))?;
                 tmp.write_all(&bytes)
                     .map_err(|e| AudioError::Internal(e.to_string()))?;
-                let path = tmp.into_temp_path();
-                audio_path = Some(path.to_string_lossy().to_string());
+                audio_path = Some(tmp.path().to_string_lossy().to_string());
+                tmp_file = Some(tmp);
             }
             "description" => {
                 description = field.text().await
@@ -74,6 +75,7 @@ pub async fn create_separation(
     let target_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &target_bytes);
     let residual_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &residual_bytes);
 
+    drop(tmp_file);
     Ok(Json(SeparationResponse {
         target_url: Some(format!("data:audio/wav;base64,{}", target_b64)),
         residual_url: Some(format!("data:audio/wav;base64,{}", residual_b64)),

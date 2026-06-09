@@ -17,6 +17,7 @@ pub async fn create_translation(
         state.audio.load_stt(state.config.default_stt_model.clone()).await?;
     }
 
+    let mut tmp_file: Option<tempfile::NamedTempFile> = None;
     let mut audio_path: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut temperature = 0.0f64;
@@ -33,8 +34,8 @@ pub async fn create_translation(
                     .map_err(|e| AudioError::Internal(e.to_string()))?;
                 tmp.write_all(&bytes)
                     .map_err(|e| AudioError::Internal(e.to_string()))?;
-                let path = tmp.into_temp_path();
-                audio_path = Some(path.to_string_lossy().to_string());
+                audio_path = Some(tmp.path().to_string_lossy().to_string());
+                tmp_file = Some(tmp);
             }
             "prompt" => {
                 prompt = Some(field.text().await
@@ -64,5 +65,6 @@ pub async fn create_translation(
         false,
     ).await?;
 
+    drop(tmp_file);
     Ok(Json(TranscriptionResponse { text, segments: None, language, duration: None }))
 }

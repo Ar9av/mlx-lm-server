@@ -172,9 +172,11 @@ impl AudioService {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("voice", voice.as_str())?;
                 kwargs.set_item("speed", speed)?;
-                if let Some(ref lang) = language {
-                    kwargs.set_item("lang_code", lang.as_str())?;
-                }
+                // Derive lang_code from voice prefix (af_/am_ → "a", bf_/bm_ → "b")
+                // or use explicit language override. Fallback "a" avoids espeak dependency.
+                let lang_code = language.as_deref()
+                    .unwrap_or_else(|| lang_code_from_voice(&voice));
+                kwargs.set_item("lang_code", lang_code)?;
                 if let Some(ref ra) = ref_audio {
                     kwargs.set_item("ref_audio", ra.as_str())?;
                 }
@@ -243,9 +245,9 @@ impl AudioService {
                     let kwargs = PyDict::new(py);
                     kwargs.set_item("voice", voice.as_str())?;
                     kwargs.set_item("speed", speed)?;
-                    if let Some(ref lang) = language {
-                        kwargs.set_item("lang_code", lang.as_str())?;
-                    }
+                    let lang_code = language.as_deref()
+                        .unwrap_or_else(|| lang_code_from_voice(&voice));
+                    kwargs.set_item("lang_code", lang_code)?;
                     kwargs.set_item("verbose", false)?;
                     kwargs.set_item("stream", true)?;
                     kwargs.set_item("streaming_interval", 1.0f64)?;
@@ -384,6 +386,18 @@ impl AudioService {
 
 // ── Audio helpers ─────────────────────────────────────────────────────────────
 
+// Infer Kokoro lang_code from voice prefix so callers don't need to set it.
+// af_/am_ → American English "a", bf_/bm_ → British English "b", rest → "a".
+fn lang_code_from_voice(voice: &str) -> &'static str {
+    match voice.get(..2) {
+        Some("af") | Some("am") => "a",
+        Some("bf") | Some("bm") => "b",
+        Some("jf") | Some("jm") => "j",
+        Some("zf") | Some("zm") => "z",
+        _ => "a",
+    }
+}
+
 fn audio_to_bytes(
     py: Python<'_>,
     audio: &PyAny,
@@ -460,9 +474,9 @@ fn chunk_to_wav_bytes(
 
     let mut out = Vec::new();
     if include_header {
-        // Minimal WAV header (size=0xFFFFFFFF for streaming)
+        // Use 0xFFFFFFFF sentinel for streaming (size unknown at header time)
         let data_len = u32::MAX;
-        let chunk_size = data_len + 36;
+        let chunk_size = u32::MAX; // also sentinel — client ignores for streaming
         out.extend_from_slice(b"RIFF");
         out.extend_from_slice(&chunk_size.to_le_bytes());
         out.extend_from_slice(b"WAVE");

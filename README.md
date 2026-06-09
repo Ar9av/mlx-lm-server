@@ -96,7 +96,7 @@ Or:
 
 ```bash
 python3.13 -m venv .venv && source .venv/bin/activate
-pip install mlx-audio numpy
+pip install mlx-audio numpy misaki num2words spacy phonemizer
 
 export PYO3_PYTHON="$(pwd)/.venv/bin/python"
 cargo build --release -p mlx-audio-server
