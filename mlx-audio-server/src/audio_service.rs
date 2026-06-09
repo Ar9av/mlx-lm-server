@@ -105,6 +105,8 @@ impl AudioService {
         let (model_py, processor_py) = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<(PyObject, PyObject)> {
                 let sts = py.import("mlx_audio.sts")?;
+                // SAMAudio accepts file-path lists directly in separate_long,
+                // but we also load the processor for numpy-array inputs.
                 let model = sts.getattr("SAMAudio")?
                     .call_method1("from_pretrained", (&mid,))?;
                 let processor = sts.getattr("SAMAudioProcessor")?
@@ -169,6 +171,8 @@ impl AudioService {
 
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<Vec<u8>> {
+                let mx = py.import("mlx.core")?;
+                mx.call_method1("eval", (mx.call_method1("zeros", (1_i32,))?,))?;
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("voice", voice.as_str())?;
                 kwargs.set_item("speed", speed)?;
@@ -242,6 +246,8 @@ impl AudioService {
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| {
                 let run = || -> PyResult<()> {
+                    let mx = py.import("mlx.core")?;
+                    mx.call_method1("eval", (mx.call_method1("zeros", (1_i32,))?,))?;
                     let kwargs = PyDict::new(py);
                     kwargs.set_item("voice", voice.as_str())?;
                     kwargs.set_item("speed", speed)?;
@@ -295,6 +301,8 @@ impl AudioService {
 
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<(String, Vec<TranscriptionSegment>, Option<String>)> {
+                let mx = py.import("mlx.core")?;
+                mx.call_method1("eval", (mx.call_method1("zeros", (1_i32,))?,))?;
                 let kwargs = PyDict::new(py);
                 if let Some(ref lang) = language {
                     kwargs.set_item("language", lang.as_str())?;
@@ -345,26 +353,20 @@ impl AudioService {
 
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<()> {
+                // MLX Metal streams are thread-local; force init on this thread
+                // before touching any model arrays from another thread.
+                let mx = py.import("mlx.core")?;
+                mx.call_method1("eval", (mx.call_method1("zeros", (1_i32,))?,))?;
+
                 let sts_mod = py.import("mlx_audio.sts")?;
 
-                let batch = processor_ref.as_ref(py).call_method(
-                    "__call__",
-                    (),
-                    Some({
-                        let kw = PyDict::new(py);
-                        kw.set_item("descriptions", vec![description.as_str()])?;
-                        kw.set_item("audios", vec![audio_path.as_str()])?;
-                        kw
-                    }),
-                )?;
-
-                let audios = batch.getattr("audios")?;
-                let descs = batch.getattr("descriptions")?;
-
+                // separate_long accepts List[str] paths directly
                 let sep_kwargs = PyDict::new(py);
-                sep_kwargs.set_item("descriptions", descs)?;
+                sep_kwargs.set_item("descriptions", vec![description.as_str()])?;
                 sep_kwargs.set_item("chunk_seconds", 10.0f64)?;
+                sep_kwargs.set_item("verbose", false)?;
 
+                let audios = pyo3::types::PyList::new(py, [audio_path.as_str()]);
                 let result = model_ref.as_ref(py)
                     .call_method("separate_long", (audios,), Some(sep_kwargs))?;
 
@@ -372,8 +374,12 @@ impl AudioService {
                 let target = result.getattr("target")?.get_item(0)?;
                 let residual = result.getattr("residual")?.get_item(0)?;
 
-                save_audio.call1((target, output_target.as_str()))?;
-                save_audio.call1((residual, output_residual.as_str()))?;
+                // save_audio(array, path, sample_rate=48000)
+                let sr = model_ref.as_ref(py).getattr("sample_rate")
+                    .and_then(|v| v.extract::<u32>())
+                    .unwrap_or(48000);
+                save_audio.call1((target, output_target.as_str(), sr))?;
+                save_audio.call1((residual, output_residual.as_str(), sr))?;
 
                 Ok(())
             })
