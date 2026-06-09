@@ -35,6 +35,8 @@ pub async fn messages(
     let max_tokens = req.max_tokens;
     let temperature = req.temperature.unwrap_or(state.config.default_temperature);
     let top_p = req.top_p.unwrap_or(state.config.default_top_p);
+    let kv_bits = req.kv_bits;
+    let kv_group_size = req.kv_group_size;
 
     let _permit = match state.inference_sem.clone().acquire_owned().await {
         Ok(p) => p,
@@ -43,9 +45,9 @@ pub async fn messages(
     };
 
     if req.stream {
-        stream_messages(state, messages, model_name, max_tokens, temperature, top_p, _permit).await
+        stream_messages(state, messages, model_name, max_tokens, temperature, top_p, kv_bits, kv_group_size, _permit).await
     } else {
-        sync_messages(state, messages, model_name, max_tokens, temperature, top_p, _permit).await
+        sync_messages(state, messages, model_name, max_tokens, temperature, top_p, kv_bits, kv_group_size, _permit).await
     }
 }
 
@@ -56,10 +58,12 @@ async fn sync_messages(
     max_tokens: usize,
     temperature: f64,
     top_p: f64,
+    kv_bits: Option<u32>,
+    kv_group_size: Option<u32>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> axum::response::Response {
     info!("Anthropic sync message for model {}", model_name);
-    match state.mlx.generate_response(messages, max_tokens, temperature, top_p, serde_json::Value::Object(Default::default())).await {
+    match state.mlx.generate_response(messages, max_tokens, temperature, top_p, serde_json::Value::Object(Default::default()), kv_bits, kv_group_size).await {
         Ok((content, prompt_tokens, completion_tokens)) => {
             let resp = AnthropicResponse::new(
                 MlxService::new_msg_id(),
@@ -81,6 +85,8 @@ async fn stream_messages(
     max_tokens: usize,
     temperature: f64,
     top_p: f64,
+    kv_bits: Option<u32>,
+    kv_group_size: Option<u32>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> axum::response::Response {
     let msg_id = MlxService::new_msg_id();
@@ -88,7 +94,7 @@ async fn stream_messages(
 
     let token_stream = match state.mlx.generate_stream(
         messages, max_tokens, temperature, top_p, timeout,
-        serde_json::Value::Object(Default::default()),
+        serde_json::Value::Object(Default::default()), kv_bits, kv_group_size,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
