@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::MlxError;
-use crate::models::{ChatMessage, MountedAdapterInfo, SamplerParams};
+use crate::models::{ChatMessage, MountedAdapterInfo, SamplerParams, Tool, ToolCall};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
@@ -294,15 +294,16 @@ impl MlxService {
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
         adapter_name: Option<String>,
-    ) -> Result<(String, usize, usize), MlxError> {
+        tools: Option<Vec<Tool>>,
+    ) -> Result<(String, usize, usize, Vec<ToolCall>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> PyResult<(String, usize, usize)> {
+            Python::with_gil(|py| -> PyResult<(String, usize, usize, Vec<ToolCall>)> {
                 let tokenizer = tokenizer_py.as_ref(py);
                 let windowed = apply_sliding_window(messages, MAX_WINDOW_TOKENS, py, tokenizer);
-                let prompt = apply_chat_template(py, tokenizer, &windowed, &chat_template_kwargs)?;
+                let prompt = apply_chat_template(py, tokenizer, &windowed, &chat_template_kwargs, tools.as_deref())?;
                 let prompt_tokens = count_tokens(py, tokenizer, &prompt);
 
                 let mlx_lm = py.import("mlx_lm")?;
@@ -331,7 +332,14 @@ impl MlxService {
                     .extract()?;
 
                 let completion_tokens = count_tokens(py, tokenizer, &response);
-                Ok((response, prompt_tokens, completion_tokens))
+                let parsed_tool_calls = if tools.is_some() {
+                    parse_tool_calls(py, tokenizer, &response).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                // If tool calls were parsed, the content is just the raw model output;
+                // callers check tool_calls.is_empty() to decide finish_reason.
+                Ok((response, prompt_tokens, completion_tokens, parsed_tool_calls))
             })
         })
         .await
@@ -351,6 +359,7 @@ impl MlxService {
         kv_bits: Option<u32>,
         kv_group_size: Option<u32>,
         adapter_name: Option<String>,
+        tools: Option<Vec<Tool>>,
     ) -> Result<ReceiverStream<Result<String, MlxError>>, MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
@@ -362,7 +371,7 @@ impl MlxService {
                     let tokenizer = tokenizer_py.as_ref(py);
                     let windowed = apply_sliding_window(messages, MAX_WINDOW_TOKENS, py, tokenizer);
                     let prompt =
-                        apply_chat_template(py, tokenizer, &windowed, &chat_template_kwargs)?;
+                        apply_chat_template(py, tokenizer, &windowed, &chat_template_kwargs, tools.as_deref())?;
 
                     let mlx_lm = py.import("mlx_lm")?;
                     let py_sampler = make_sampler(py, &sampler)?;
@@ -388,6 +397,11 @@ impl MlxService {
                         .getattr("stream_generate")?
                         .call((model_py.as_ref(py), tokenizer), Some(kwargs))?;
 
+                    // When tools are provided, buffer full output and emit tool calls at end.
+                    // For regular streaming, emit tokens as they arrive.
+                    let has_tools = tools.is_some();
+                    let mut full_output = if has_tools { Some(String::new()) } else { None };
+
                     let start = Instant::now();
                     for item in generator.iter()? {
                         if start.elapsed().as_secs_f64() > timeout_secs {
@@ -396,8 +410,26 @@ impl MlxService {
                             return Ok(());
                         }
                         let text: String = item?.getattr("text")?.extract()?;
-                        if tx.blocking_send(Ok(text)).is_err() {
+                        if let Some(ref mut buf) = full_output {
+                            buf.push_str(&text);
+                        } else if tx.blocking_send(Ok(text)).is_err() {
                             break;
+                        }
+                    }
+
+                    // After full generation, parse and emit tool calls as a sentinel token
+                    if let Some(buf) = full_output {
+                        let tool_calls = parse_tool_calls(py, tokenizer, &buf).unwrap_or_default();
+                        if !tool_calls.is_empty() {
+                            // Encode tool calls as JSON sentinel for the stream handler to pick up
+                            let sentinel = format!(
+                                "\x00TOOL_CALLS:{}\x00",
+                                serde_json::to_string(&tool_calls).unwrap_or_default()
+                            );
+                            let _ = tx.blocking_send(Ok(sentinel));
+                        } else {
+                            // No tool calls detected — emit content normally
+                            let _ = tx.blocking_send(Ok(buf));
                         }
                     }
                     Ok(())
@@ -687,11 +719,85 @@ fn apply_sliding_window(
     result
 }
 
+fn parse_tool_calls(py: Python, tokenizer: &PyAny, text: &str) -> PyResult<Vec<ToolCall>> {
+    // Detect which tool parser the tokenizer uses (if any)
+    let has_tool_calling = tokenizer
+        .getattr("has_tool_calling")
+        .and_then(|v| v.extract::<bool>())
+        .unwrap_or(false);
+
+    if !has_tool_calling {
+        // Fallback: try json_tools parser directly (many models use <tool_call>...</tool_call>)
+        let has_delimiters = text.contains("<tool_call>") && text.contains("</tool_call>");
+        if !has_delimiters {
+            return Ok(vec![]);
+        }
+    }
+
+    let tool_parser = match tokenizer.getattr("tool_parser") {
+        Ok(p) if !p.is_none() => p,
+        _ => {
+            // Try json_tools as fallback
+            let m = py.import("mlx_lm.tool_parsers.json_tools")?;
+            m.getattr("parse_tool_call")?
+        }
+    };
+
+    let tool_call_start: String = tokenizer
+        .getattr("tool_call_start")
+        .and_then(|v| v.extract::<String>())
+        .unwrap_or_else(|_| "<tool_call>".into());
+    let tool_call_end: String = tokenizer
+        .getattr("tool_call_end")
+        .and_then(|v| v.extract::<String>())
+        .unwrap_or_else(|_| "</tool_call>".into());
+
+    // Extract all segments between delimiters
+    let mut tool_calls = vec![];
+    let mut remaining = text;
+    while let Some(start) = remaining.find(tool_call_start.as_str()) {
+        let after_start = &remaining[start + tool_call_start.len()..];
+        let end = if tool_call_end.is_empty() {
+            after_start.len()
+        } else {
+            after_start.find(tool_call_end.as_str()).unwrap_or(after_start.len())
+        };
+        let segment = &after_start[..end];
+        match tool_parser.call1((segment,)) {
+            Ok(parsed) => {
+                let name: String = parsed.get_item("name")?.extract()?;
+                let args_py = parsed.get_item("arguments")?;
+                let args_val: serde_json::Value = if let Ok(s) = args_py.extract::<String>() {
+                    serde_json::from_str(&s).unwrap_or(serde_json::Value::Object(Default::default()))
+                } else {
+                    let args_str: String = py
+                        .import("json")?
+                        .call_method1("dumps", (args_py,))?
+                        .extract()?;
+                    serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Object(Default::default()))
+                };
+                tool_calls.push(ToolCall::new(name, args_val));
+            }
+            Err(e) => {
+                warn!("Failed to parse tool call segment: {}", e);
+            }
+        }
+        remaining = if tool_call_end.is_empty() {
+            ""
+        } else {
+            let skip = start + tool_call_start.len() + end + tool_call_end.len();
+            &remaining[skip.min(remaining.len())..]
+        };
+    }
+    Ok(tool_calls)
+}
+
 fn apply_chat_template(
     py: Python,
     tokenizer: &PyAny,
     messages: &[ChatMessage],
     extra_kwargs: &serde_json::Value,
+    tools: Option<&[Tool]>,
 ) -> PyResult<String> {
     let prepared = prepare_messages(messages);
 
@@ -720,6 +826,32 @@ fn apply_chat_template(
                 let py_val = json_to_py(py, v)?;
                 kwargs.set_item(k.as_str(), py_val)?;
             }
+        }
+
+        // Pass tools to the chat template when provided — models like Llama-3,
+        // Qwen, and Mistral encode tool definitions into the system prompt via
+        // their chat template's `tools` variable.
+        if let Some(tool_list) = tools {
+            let py_tools = PyList::new(
+                py,
+                tool_list.iter().map(|t| {
+                    let d = PyDict::new(py);
+                    d.set_item("type", &t.kind).unwrap();
+                    let f = PyDict::new(py);
+                    f.set_item("name", &t.function.name).unwrap();
+                    if let Some(desc) = &t.function.description {
+                        f.set_item("description", desc).unwrap();
+                    }
+                    if let Some(params) = &t.function.parameters {
+                        if let Ok(py_params) = json_to_py(py, params) {
+                            f.set_item("parameters", py_params).unwrap();
+                        }
+                    }
+                    d.set_item("function", f).unwrap();
+                    d
+                }),
+            );
+            kwargs.set_item("tools", py_tools)?;
         }
 
         let result: String = tokenizer

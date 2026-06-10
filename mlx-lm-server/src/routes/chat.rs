@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::error::MlxError;
 use crate::mlx_service::{MlxService, MAX_MESSAGE_TOKENS};
-use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent, SamplerParams, TokenizeRequest, TokenizeResponse, Usage};
+use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent, SamplerParams, TokenizeRequest, TokenizeResponse, Tool, ToolCall, Usage};
 use crate::state::AppState;
 
 pub async fn chat_completions(
@@ -104,6 +104,7 @@ pub async fn chat_completions(
     let kv_bits = req.kv_bits;
     let kv_group_size = req.kv_group_size;
     let adapter_name = req.adapter_name.clone();
+    let tools = req.tools.clone();
 
     let permit = match state.inference_sem.clone().acquire_owned().await {
         Ok(p) => p,
@@ -112,9 +113,9 @@ pub async fn chat_completions(
     };
 
     if req.stream.unwrap_or(false) {
-        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
+        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, permit).await
     } else {
-        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, permit).await
+        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, permit).await
     }
 }
 
@@ -128,19 +129,20 @@ async fn sync_response(
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
     adapter_name: Option<String>,
+    tools: Option<Vec<Tool>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     info!("Generating sync response for model {}", model_name);
 
-    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name).await {
-        Ok((content, prompt_tokens, completion_tokens)) => {
-            let resp = ChatCompletionResponse::new(
-                MlxService::new_chat_id(),
-                model_name,
-                content,
-                Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
-            );
+    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools).await {
+        Ok((content, prompt_tokens, completion_tokens, tool_calls)) => {
+            let usage = Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
+            let resp = if !tool_calls.is_empty() {
+                ChatCompletionResponse::with_tool_calls(MlxService::new_chat_id(), model_name, tool_calls, usage)
+            } else {
+                ChatCompletionResponse::new(MlxService::new_chat_id(), model_name, content, usage)
+            };
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
@@ -149,6 +151,8 @@ async fn sync_response(
         }
     }
 }
+
+const TOOL_SENTINEL: &str = "\x00TOOL_CALLS:";
 
 async fn stream_response(
     state: AppState,
@@ -160,6 +164,7 @@ async fn stream_response(
     kv_bits: Option<u32>,
     kv_group_size: Option<u32>,
     adapter_name: Option<String>,
+    tools: Option<Vec<Tool>>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
@@ -167,7 +172,7 @@ async fn stream_response(
     let timeout = state.config.stream_timeout;
 
     let token_stream = match state.mlx.generate_stream(
-        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name,
+        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -180,9 +185,19 @@ async fn stream_response(
     let sse_stream = token_stream.map(move |result| -> Result<Bytes, std::io::Error> {
         let data = match result {
             Ok(token) => {
-                let chunk = ChatCompletionChunk::token(&chat_id_clone, &model_clone, &token, first);
-                first = false;
-                serde_json::to_string(&chunk).unwrap_or_default()
+                // Check for tool call sentinel emitted by generate_stream
+                if token.starts_with(TOOL_SENTINEL) {
+                    let json_part = token
+                        .trim_start_matches(TOOL_SENTINEL)
+                        .trim_end_matches('\x00');
+                    let tool_calls: Vec<ToolCall> = serde_json::from_str(json_part).unwrap_or_default();
+                    let chunk = ChatCompletionChunk::tool_calls_chunk(&chat_id_clone, &model_clone, tool_calls);
+                    serde_json::to_string(&chunk).unwrap_or_default()
+                } else {
+                    let chunk = ChatCompletionChunk::token(&chat_id_clone, &model_clone, &token, first);
+                    first = false;
+                    serde_json::to_string(&chunk).unwrap_or_default()
+                }
             }
             Err(e) => serde_json::json!({
                 "error": { "message": e.to_string(), "type": "server_error" }
@@ -198,7 +213,7 @@ async fn stream_response(
     );
 
     let combined = sse_stream.chain(futures::stream::once(async move {
-        drop(permit); // Release semaphore when body is fully consumed
+        drop(permit);
         Ok::<Bytes, std::io::Error>(Bytes::from(final_data))
     }));
 

@@ -98,6 +98,49 @@ pub struct ResponseFormat {
     pub json_schema: Option<serde_json::Value>,
 }
 
+// ── Tool use ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ToolFunction {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub kind: String,  // "function"
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,  // JSON string (OpenAI format)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+impl ToolCall {
+    pub fn new(name: String, arguments: serde_json::Value) -> Self {
+        Self {
+            id: format!("call_{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name,
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+}
+
 // ── Chat completions ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +160,8 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopSequence>,
     pub n: Option<u32>,
     pub response_format: Option<ResponseFormat>,
+    pub tools: Option<Vec<Tool>>,
+    pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub chat_template_kwargs: serde_json::Value,
     pub kv_bits: Option<u32>,
@@ -145,6 +190,23 @@ impl ChatCompletionResponse {
                 index: 0,
                 message: ChatMessage { role: "assistant".into(), content: MessageContent::Text(content) },
                 finish_reason: Some("stop".into()),
+                tool_calls: None,
+            }],
+            usage,
+        }
+    }
+
+    pub fn with_tool_calls(id: String, model: String, tool_calls: Vec<ToolCall>, usage: Usage) -> Self {
+        Self {
+            id,
+            object: "chat.completion",
+            created: now_secs(),
+            model,
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: ChatMessage { role: "assistant".into(), content: MessageContent::Text(String::new()) },
+                finish_reason: Some("tool_calls".into()),
+                tool_calls: Some(tool_calls),
             }],
             usage,
         }
@@ -156,6 +218,8 @@ pub struct ChatCompletionChoice {
     pub index: u32,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,7 +240,7 @@ impl ChatCompletionChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: if first { Some("assistant".into()) } else { None }, content: Some(content.to_string()) },
+                delta: Delta { role: if first { Some("assistant".into()) } else { None }, content: Some(content.to_string()), tool_calls: None },
                 finish_reason: None,
             }],
         }
@@ -190,8 +254,22 @@ impl ChatCompletionChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: None, content: None },
+                delta: Delta { role: None, content: None, tool_calls: None },
                 finish_reason: Some("stop".into()),
+            }],
+        }
+    }
+
+    pub fn tool_calls_chunk(id: &str, model: &str, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            id: id.to_string(),
+            object: "chat.completion.chunk",
+            created: now_secs(),
+            model: model.to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta { role: Some("assistant".into()), content: None, tool_calls: Some(tool_calls) },
+                finish_reason: Some("tool_calls".to_string()),
             }],
         }
     }
@@ -210,6 +288,8 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 // ── Text completions (legacy) ─────────────────────────────────────────────────

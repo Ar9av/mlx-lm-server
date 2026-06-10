@@ -116,6 +116,7 @@ OpenAI-compatible LLM inference powered by [mlx-lm](https://github.com/ml-explor
 - **Speculative decoding** — pass `drafter` in load request, `num_draft_tokens` per request
 - **KV-cache quantization** — `kv_bits` + `kv_group_size` per request
 - **Full sampler control** — `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`
+- **Tool use / function calling** — `tools` + `tool_choice` in any chat request; auto-detects model's tool parser (Llama-3, Qwen, Mistral, Gemma, etc.)
 - **Benchmarking** (`POST /v1/benchmark`) — TTFT/tps percentiles
 - **Model info** (`GET /v1/models/:id/info`) — scans HF cache, reads config.json
 - **RAM guard** — rejects loads that would exceed available memory
@@ -165,6 +166,30 @@ curl -X POST http://localhost:8080/v1/models/load \
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"llama","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Tool use / function calling
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "llama",
+    "messages": [{"role":"user","content":"What is the weather in London?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "City name"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+          },
+          "required": ["location"]
+        }
+      }
+    }]
+  }'
+# → {"choices":[{"finish_reason":"tool_calls","tool_calls":[{"id":"call_abc123","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"London\"}"}}]}]}
 
 # Chat with sampler params
 curl http://localhost:8080/v1/chat/completions \
