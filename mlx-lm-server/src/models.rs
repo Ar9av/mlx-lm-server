@@ -557,6 +557,116 @@ pub struct AdapterListResponse {
     pub adapters: Vec<MountedAdapterInfo>,
 }
 
+// ── Fine-tuning (LoRA / DoRA / full) ──────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct TrainRequest {
+    /// Base model (HuggingFace repo or local path)
+    pub model: String,
+    /// Directory containing train.jsonl / valid.jsonl / test.jsonl
+    pub data: String,
+    /// "lora" | "dora" | "full"  (default: "lora")
+    #[serde(default = "default_fine_tune_type")]
+    pub fine_tune_type: String,
+    /// Where to save adapter weights (default: "./adapters")
+    #[serde(default = "default_adapter_path")]
+    pub adapter_path: String,
+    /// Number of transformer layers to fine-tune (default: 16, -1 = all)
+    pub num_layers: Option<i32>,
+    /// Training iterations (default: 100)
+    pub iters: Option<usize>,
+    /// Mini-batch size (default: 4)
+    pub batch_size: Option<usize>,
+    /// Adam learning rate (default: 1e-4)
+    pub learning_rate: Option<f64>,
+    /// "adam" | "adamw" | "muon" | "sgd" | "adafactor" (default: "adamw")
+    pub optimizer: Option<String>,
+    /// Max sequence length (default: 2048)
+    pub max_seq_length: Option<usize>,
+    /// Gradient accumulation steps (default: 1)
+    pub grad_accumulation_steps: Option<usize>,
+    /// Report every N steps (default: 10)
+    pub steps_per_report: Option<usize>,
+    /// Validate every N steps (default: 200)
+    pub steps_per_eval: Option<usize>,
+    /// Save checkpoint every N steps (default: 100)
+    pub save_every: Option<usize>,
+    /// Mask prompt tokens in loss (default: false)
+    #[serde(default)]
+    pub mask_prompt: bool,
+    /// Resume from existing adapter checkpoint
+    pub resume_adapter_file: Option<String>,
+    /// Run evaluation on test set after training (default: false)
+    #[serde(default)]
+    pub test: bool,
+    /// Gradient checkpointing to save memory (default: false)
+    #[serde(default)]
+    pub grad_checkpoint: bool,
+}
+
+fn default_fine_tune_type() -> String { "lora".into() }
+fn default_adapter_path() -> String { "./adapters".into() }
+
+#[derive(Debug, Serialize)]
+pub struct TrainProgress {
+    pub event: &'static str,   // "progress" | "done" | "error"
+    pub step: Option<usize>,
+    pub loss: Option<f64>,
+    pub val_loss: Option<f64>,
+    pub tokens_per_sec: Option<f64>,
+    pub adapter_path: Option<String>,
+    pub message: Option<String>,
+}
+
+// ── Fuse (merge adapter into base model) ─────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct FuseRequest {
+    /// Adapter name (must be mounted) or raw adapter path
+    pub adapter: String,
+    /// Where to save the fused model (default: ./fused-<adapter>)
+    pub output: Option<String>,
+    /// Also export as GGUF  (default: false)
+    #[serde(default)]
+    pub export_gguf: bool,
+    /// De-quantize before fusing (default: false)
+    #[serde(default)]
+    pub dequantize: bool,
+    /// Upload fused model to HuggingFace (optional)
+    pub upload_repo: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FuseResponse {
+    pub output_path: String,
+    pub gguf_path: Option<String>,
+    pub uploaded_to: Option<String>,
+}
+
+// ── Convert (GGUF / HF → MLX) ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ConvertRequest {
+    /// Source HuggingFace repo or local path
+    pub model: String,
+    /// Output path for the converted MLX model (default: ./mlx-<model>)
+    pub output: Option<String>,
+    /// Quantize bits: 4 or 8 (omit for fp16)
+    pub quantize_bits: Option<u32>,
+    /// Quantize group size (default: 64)
+    pub quantize_group_size: Option<u32>,
+    /// Upload to HuggingFace after conversion
+    pub upload_repo: Option<String>,
+    /// HuggingFace token for private models / uploads
+    pub hf_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConvertResponse {
+    pub output_path: String,
+    pub uploaded_to: Option<String>,
+}
+
 // ── HuggingFace search ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

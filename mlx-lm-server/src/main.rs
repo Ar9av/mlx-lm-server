@@ -78,6 +78,10 @@ async fn main() {
         .route("/v1/adapters", get(routes::adapters::list_adapters))
         .route("/v1/adapters/mount", post(routes::adapters::mount_adapter))
         .route("/v1/adapters/:name", delete(routes::adapters::unmount_adapter))
+        .route("/v1/adapters/:name/fuse", post(routes::finetune::fuse_adapter))
+        // Fine-tuning
+        .route("/v1/train", post(routes::train::train))
+        .route("/v1/convert", post(routes::finetune::convert))
         // Anthropic-compatible
         .route("/v1/messages", post(routes::anthropic::messages))
         // Model cache + discovery

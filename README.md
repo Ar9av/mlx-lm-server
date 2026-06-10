@@ -61,23 +61,28 @@ mlx-lm ships a built-in Python server. This project wraps it in a Rust HTTP laye
 
 ### Fine-tuning workflow
 
-mlx-lm's CLI (`python -m mlx_lm.lora --train`, `mlx_lm.fuse`) handles offline LoRA/QLoRA/DoRA training. This server handles the inference side of that workflow:
+mlx-lm's CLI handles offline training via `mlx_lm.lora --train` and `mlx_lm.fuse`. This server wraps those same Python modules behind HTTP endpoints — train, fuse, and convert without leaving the API:
 
 ```bash
-# 1. Train adapter with mlx-lm CLI (offline, one-time)
-python -m mlx_lm.lora --train --model mlx-community/Llama-3.2-3B-Instruct-4bit \
-  --data ./my-data --iters 1000 --output-dir ./my-adapter
+# 1. Train via API — streams SSE progress events while training runs
+curl http://localhost:8080/v1/train \
+  -d '{"model":"mlx-community/Llama-3.2-3B-Instruct-4bit",
+       "data":"./my-data","iters":1000,"adapter_path":"./my-adapter"}'
 
-# 2. Mount the trained adapter at runtime via API (no restart)
+# 2. Mount the trained adapter (no restart)
 curl -X POST http://localhost:8080/v1/adapters/mount \
   -d '{"name":"my-lora","adapter_path":"./my-adapter"}'
 
-# 3. Route specific requests to it
+# 3. Route specific requests to it (per-request, same server)
 curl http://localhost:8080/v1/chat/completions \
   -d '{"messages":[...],"adapter_name":"my-lora"}'
+
+# 4. Fuse adapter into base model when done iterating
+curl -X POST http://localhost:8080/v1/adapters/my-lora/fuse \
+  -d '{"adapter":"my-lora","output":"./fused-model"}'
 ```
 
-Multiple adapters can be mounted simultaneously on the same base model, each reachable by name per request.
+Multiple adapters can be mounted simultaneously on the same base model, each reachable by name per request. `mlx_lm.lora --train` still works for offline training; the API is an additional option.
 
 ---
 
@@ -114,6 +119,9 @@ OpenAI-compatible LLM inference powered by [mlx-lm](https://github.com/ml-explor
 - **Benchmarking** (`POST /v1/benchmark`) — TTFT/tps percentiles
 - **Model info** (`GET /v1/models/:id/info`) — scans HF cache, reads config.json
 - **RAM guard** — rejects loads that would exceed available memory
+- **Fine-tuning** (`POST /v1/train`) — LoRA / DoRA / full fine-tuning with SSE progress stream
+- **Adapter fuse** (`POST /v1/adapters/:name/fuse`) — merge adapter weights into base model
+- **Model convert** (`POST /v1/convert`) — convert GGUF or HuggingFace models to MLX format
 
 ### Sampler parameters
 
@@ -178,6 +186,31 @@ curl http://localhost:8080/v1/chat/completions \
 curl -X POST http://localhost:8080/v1/adapters/mount \
   -H 'Content-Type: application/json' \
   -d '{"name":"my-lora","adapter_path":"/path/to/adapter","model":"mlx-community/Llama-3.2-3B-Instruct-4bit"}'
+
+# Fine-tune (LoRA) — streams SSE progress events
+curl http://localhost:8080/v1/train \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    "data": "./my-data",
+    "fine_tune_type": "lora",
+    "adapter_path": "./my-adapter",
+    "iters": 500,
+    "batch_size": 4,
+    "learning_rate": 1e-4
+  }'
+# data: {"event":"progress","message":"Training lora — 500 iters, lr=1e-4"}
+# data: {"event":"done","adapter_path":"./my-adapter","message":"Training complete"}
+
+# Fuse adapter into base model
+curl -X POST http://localhost:8080/v1/adapters/my-lora/fuse \
+  -H 'Content-Type: application/json' \
+  -d '{"adapter":"my-lora","output":"./fused-model"}'
+
+# Convert GGUF or HF model to MLX (with optional quantization)
+curl -X POST http://localhost:8080/v1/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bartowski/Llama-3.2-3B-Instruct-GGUF","output":"./mlx-llama3","quantize_bits":4}'
 ```
 
 ---
