@@ -13,6 +13,74 @@ A monorepo of OpenAI-compatible inference servers for Apple Silicon, written in 
 
 ---
 
+## Why not `python -m mlx_lm.server`?
+
+mlx-lm ships a built-in Python server. This project wraps it in a Rust HTTP layer and extends it significantly. Here's what's different:
+
+### Runtime
+
+| | `mlx_lm.server` | mlx-local-server |
+|---|---|---|
+| Language | Python (uvicorn/starlette) | Rust (tokio + axum) |
+| Idle RSS | ~60–100 MB | **8 MB** |
+| Cold start | ~3–5 s (Python imports) | **16 ms** |
+| Concurrency | asyncio + GIL contention | tokio async, GIL only during inference |
+| Deployment | needs Python env in PATH | single self-contained binary |
+
+### API surface
+
+| Feature | `mlx_lm.server` | mlx-local-server |
+|---|---|---|
+| OpenAI chat completions + streaming | ✅ | ✅ |
+| Text completions | ✅ | ✅ |
+| Embeddings | ❌ | ✅ |
+| Anthropic Messages API | ❌ | ✅ |
+| Vision routing (`mlx_vlm`) | ❌ | ✅ auto-detects `image_url` |
+| TTS / STT / source separation | ❌ | ✅ (mlx-audio-server) |
+| Tokenize endpoint | ❌ | ✅ |
+| Built-in benchmarking (TTFT + tok/s percentiles) | ❌ | ✅ |
+| HuggingFace Hub model search | ❌ | ✅ |
+| Ollama `/api/ps` compat | ❌ | ✅ |
+
+### Model & adapter lifecycle
+
+| Feature | `mlx_lm.server` | mlx-local-server |
+|---|---|---|
+| Runtime load/unload without restart | ❌ | ✅ |
+| LoRA adapter hot-swap | single adapter at startup | ✅ multiple, per-request routing |
+| Speculative decoding | ❌ server-level | ✅ drafter model + per-request `num_draft_tokens` |
+| RAM guard (pre-load memory check) | ❌ | ✅ |
+| Model allowlist / size limit | ❌ | ✅ env vars |
+| Scan local HuggingFace cache | ❌ | ✅ |
+
+### Sampler parameters
+
+`mlx_lm.server` exposes `temperature` and `top_p`. This server exposes all 8 mlx-lm sampling parameters — including `presence_penalty` and `frequency_penalty`, which exist in mlx-lm but were never wired through its built-in server:
+
+`temperature` · `top_p` · `top_k` · `min_p` · `repetition_penalty` · `presence_penalty` · `frequency_penalty` · `num_draft_tokens`
+
+### Fine-tuning workflow
+
+mlx-lm's CLI (`python -m mlx_lm.lora --train`, `mlx_lm.fuse`) handles offline LoRA/QLoRA/DoRA training. This server handles the inference side of that workflow:
+
+```bash
+# 1. Train adapter with mlx-lm CLI (offline, one-time)
+python -m mlx_lm.lora --train --model mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --data ./my-data --iters 1000 --output-dir ./my-adapter
+
+# 2. Mount the trained adapter at runtime via API (no restart)
+curl -X POST http://localhost:8080/v1/adapters/mount \
+  -d '{"name":"my-lora","adapter_path":"./my-adapter"}'
+
+# 3. Route specific requests to it
+curl http://localhost:8080/v1/chat/completions \
+  -d '{"messages":[...],"adapter_name":"my-lora"}'
+```
+
+Multiple adapters can be mounted simultaneously on the same base model, each reachable by name per request.
+
+---
+
 ## Quick start
 
 ```bash
