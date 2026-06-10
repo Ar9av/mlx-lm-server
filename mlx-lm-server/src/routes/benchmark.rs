@@ -61,6 +61,9 @@ pub async fn run_benchmark(
             None,
             None,
             vec![],
+            false,
+            0,
+            None,
         ).await {
             Ok(mut stream) => {
                 use tokio_stream::StreamExt;

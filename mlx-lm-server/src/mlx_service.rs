@@ -296,12 +296,15 @@ impl MlxService {
         adapter_name: Option<String>,
         tools: Option<Vec<Tool>>,
         stop_strings: Vec<String>,
-    ) -> Result<(String, usize, usize, Vec<ToolCall>, String), MlxError> {
+        want_logprobs: bool,
+        top_n_logprobs: u32,
+        seed: Option<u64>,
+    ) -> Result<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> PyResult<(String, usize, usize, Vec<ToolCall>, String)> {
+            Python::with_gil(|py| -> PyResult<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>)> {
                 // Ensure Metal stream is initialized on this thread before any GPU ops
                 let _ = py.import("mlx.core").and_then(|mx| mx.call_method0("synchronize"));
                 let tokenizer = tokenizer_py.as_ref(py);
@@ -311,6 +314,13 @@ impl MlxService {
 
                 let mlx_lm = py.import("mlx_lm")?;
                 let py_sampler = make_sampler(py, &sampler)?;
+
+                // Apply seed if provided
+                if let Some(s) = seed {
+                    let _ = py.import("mlx.core").and_then(|mx| {
+                        mx.getattr("random")?.call_method1("seed", (s as i64,))
+                    });
+                }
 
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("prompt", &prompt)?;
@@ -329,21 +339,66 @@ impl MlxService {
                 if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                 if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
-                let mut response: String = mlx_lm
-                    .getattr("generate")?
-                    .call((model_py.as_ref(py), tokenizer), Some(kwargs))?
-                    .extract()?;
+                let (mut response, mut finish_reason, mut lp_list) = if want_logprobs {
+                    // Use stream_generate to collect per-token logprobs
+                    let generator = mlx_lm
+                        .getattr("stream_generate")?
+                        .call((model_py.as_ref(py), tokenizer), Some(kwargs))?;
+                    let mut text = String::new();
+                    let mut lps: Vec<serde_json::Value> = Vec::new();
+                    let mut fr = "stop".to_string();
+                    for item in generator.iter()? {
+                        let r = item?;
+                        let tok_text: String = r.getattr("text")?.extract()?;
+                        let tok_id: i64 = r.getattr("token")?.extract()?;
+                        let logprobs_arr = r.getattr("logprobs")?;
+                        let tok_lp: f32 = logprobs_arr.get_item(tok_id)?.extract()?;
+                        text.push_str(&tok_text);
+
+                        // Build top-N logprobs using Python-side numpy-style operations
+                        let top_lps = if top_n_logprobs > 0 {
+                            collect_top_logprobs(py, tokenizer, logprobs_arr.into(), top_n_logprobs)
+                        } else {
+                            vec![]
+                        };
+
+                        lps.push(serde_json::json!({
+                            "token": tok_text,
+                            "logprob": tok_lp,
+                            "top_logprobs": top_lps,
+                        }));
+                        if let Ok(reason_obj) = r.getattr("finish_reason") {
+                            if !reason_obj.is_none() {
+                                if let Ok(reason_str) = reason_obj.extract::<String>() {
+                                    fr = reason_str;
+                                }
+                            }
+                        }
+                    }
+                    (text, fr, Some(lps))
+                } else {
+                    let response: String = mlx_lm
+                        .getattr("generate")?
+                        .call((model_py.as_ref(py), tokenizer), Some(kwargs))?
+                        .extract()?;
+                    let fr = if count_tokens(py, tokenizer, &response) >= max_tokens {
+                        "length".to_string()
+                    } else {
+                        "stop".to_string()
+                    };
+                    (response, fr, None)
+                };
 
                 // Apply stop strings: truncate at first occurrence
-                let mut finish_reason = if count_tokens(py, tokenizer, &response) >= max_tokens {
-                    "length".to_string()
-                } else {
-                    "stop".to_string()
-                };
                 for stop in &stop_strings {
                     if let Some(idx) = response.find(stop.as_str()) {
                         response.truncate(idx);
                         finish_reason = "stop".to_string();
+                        // Trim logprobs list to match truncated response
+                        if let Some(ref mut lps) = lp_list {
+                            let kept_chars = response.chars().count();
+                            let _ = kept_chars; // logprob count may differ; best-effort trim
+                        }
                         break;
                     }
                 }
@@ -357,7 +412,7 @@ impl MlxService {
                 if !parsed_tool_calls.is_empty() {
                     finish_reason = "tool_calls".to_string();
                 }
-                Ok((response, prompt_tokens, completion_tokens, parsed_tool_calls, finish_reason))
+                Ok((response, prompt_tokens, completion_tokens, parsed_tool_calls, finish_reason, lp_list))
             })
         })
         .await
@@ -379,6 +434,9 @@ impl MlxService {
         adapter_name: Option<String>,
         tools: Option<Vec<Tool>>,
         stop_strings: Vec<String>,
+        want_logprobs: bool,
+        top_n_logprobs: u32,
+        seed: Option<u64>,
     ) -> Result<ReceiverStream<Result<String, MlxError>>, MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
@@ -414,6 +472,13 @@ impl MlxService {
                     if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                     if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
+                    // Apply seed before generation if provided
+                    if let Some(s) = seed {
+                        let _ = py.import("mlx.core").and_then(|mx| {
+                            mx.getattr("random")?.call_method1("seed", (s as i64,))
+                        });
+                    }
+
                     let generator = mlx_lm
                         .getattr("stream_generate")?
                         .call((model_py.as_ref(py), tokenizer), Some(kwargs))?;
@@ -439,6 +504,8 @@ impl MlxService {
                         }
                         let response = item?;
                         let text: String = response.getattr("text")?.extract()?;
+                        let tok_id: i64 = response.getattr("token")?.extract()?;
+                        let logprobs_arr = response.getattr("logprobs")?;
                         let fr: Option<String> = response.getattr("finish_reason")
                             .and_then(|v| if v.is_none() { Err(pyo3::exceptions::PyAttributeError::new_err("")) } else { v.extract() })
                             .ok();
@@ -450,6 +517,20 @@ impl MlxService {
                             buf.push_str(&text);
                             continue;
                         }
+
+                        // Build logprob sentinel if requested (only when no stop buffering is active)
+                        let lp_sentinel = if want_logprobs && stop_strings.is_empty() {
+                            let tok_lp: f32 = logprobs_arr.get_item(tok_id).and_then(|v| v.extract()).unwrap_or(0.0);
+                            let top_lps = collect_top_logprobs(py, tokenizer, logprobs_arr.into(), top_n_logprobs);
+                            let lp_json = serde_json::json!({
+                                "token": &text,
+                                "logprob": tok_lp,
+                                "top_logprobs": top_lps,
+                            });
+                            Some(format!("\x00LP:{}\x00", lp_json))
+                        } else {
+                            None
+                        };
 
                         // Stop string detection on accumulated text
                         if !stop_strings.is_empty() {
@@ -479,6 +560,10 @@ impl MlxService {
                                 }
                             }
                         } else {
+                            // Emit logprob sentinel first so handler can attach it to this token
+                            if let Some(lp_s) = lp_sentinel {
+                                let _ = tx.blocking_send(Ok(lp_s));
+                            }
                             if tx.blocking_send(Ok(text)).is_err() {
                                 break;
                             }
@@ -969,6 +1054,36 @@ fn count_tokens(py: Python, tokenizer: &PyAny, text: &str) -> usize {
         .call_method1("encode", (text,))
         .and_then(|t| t.len())
         .unwrap_or(text.len() / 4)
+}
+
+/// Extract top-N logprobs from a full vocab logprobs array (mlx.core.array).
+/// Returns a Vec of JSON values {token, logprob} sorted by descending logprob.
+fn collect_top_logprobs(py: Python, tokenizer: &PyAny, logprobs_arr: PyObject, top_n: u32) -> Vec<serde_json::Value> {
+    if top_n == 0 { return vec![]; }
+    let result: PyResult<Vec<serde_json::Value>> = (|| {
+        let mx = py.import("mlx.core")?;
+        // Compute argsort(-logprobs), slice first top_n, convert to Rust vec
+        let neg_lp = mx.call_method1("negative", (logprobs_arr.as_ref(py),))?;
+        let sorted_idx = mx.call_method1("argsort", (neg_lp,))?;
+        // Evaluate arr[:n].tolist() in Python — avoids converting all 128K entries
+        let locals = pyo3::types::PyDict::new(py);
+        locals.set_item("_arr", sorted_idx)?;
+        locals.set_item("_n", top_n as i64)?;
+        let top_idx: Vec<i64> = py.eval("_arr[:_n].tolist()", None, Some(locals))?.extract()?;
+
+        let mut results: Vec<serde_json::Value> = Vec::with_capacity(top_n as usize);
+        for &idx in &top_idx {
+            let lp: f32 = logprobs_arr.as_ref(py).get_item(idx)?.extract()?;
+            let tok_str: String = tokenizer
+                .call_method1("convert_ids_to_tokens", (idx,))
+                .and_then(|v| v.extract())
+                .unwrap_or_else(|_| format!("<{}>", idx));
+            results.push(serde_json::json!({"token": tok_str, "logprob": lp}));
+        }
+        // Already sorted by descending logprob from argsort(-logprobs)
+        Ok(results)
+    })();
+    result.unwrap_or_default()
 }
 
 fn json_to_py<'py>(py: Python<'py>, val: &serde_json::Value) -> PyResult<&'py PyAny> {

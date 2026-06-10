@@ -162,11 +162,36 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<ResponseFormat>,
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<serde_json::Value>,
+    pub logprobs: Option<bool>,
+    pub top_logprobs: Option<u32>,
+    pub seed: Option<u64>,
     #[serde(default)]
     pub chat_template_kwargs: serde_json::Value,
     pub kv_bits: Option<u32>,
     pub kv_group_size: Option<u32>,
     pub adapter_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct LogprobsInfo {
+    pub content: Vec<TokenLogprob>,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +216,7 @@ impl ChatCompletionResponse {
                 message: ChatMessage { role: "assistant".into(), content: MessageContent::Text(content) },
                 finish_reason: Some("stop".into()),
                 tool_calls: None,
+                logprobs: None,
             }],
             usage,
         }
@@ -207,6 +233,7 @@ impl ChatCompletionResponse {
                 message: ChatMessage { role: "assistant".into(), content: MessageContent::Text(String::new()) },
                 finish_reason: Some("tool_calls".into()),
                 tool_calls: Some(tool_calls),
+                logprobs: None,
             }],
             usage,
         }
@@ -220,6 +247,8 @@ pub struct ChatCompletionChoice {
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<LogprobsInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +262,10 @@ pub struct ChatCompletionChunk {
 
 impl ChatCompletionChunk {
     pub fn token(id: &str, model: &str, content: &str, first: bool) -> Self {
+        Self::token_lp(id, model, content, first, None)
+    }
+
+    pub fn token_lp(id: &str, model: &str, content: &str, first: bool, logprobs: Option<LogprobsInfo>) -> Self {
         Self {
             id: id.to_string(),
             object: "chat.completion.chunk",
@@ -242,6 +275,7 @@ impl ChatCompletionChunk {
                 index: 0,
                 delta: Delta { role: if first { Some("assistant".into()) } else { None }, content: Some(content.to_string()), tool_calls: None },
                 finish_reason: None,
+                logprobs,
             }],
         }
     }
@@ -260,6 +294,7 @@ impl ChatCompletionChunk {
                 index: 0,
                 delta: Delta { role: None, content: None, tool_calls: None },
                 finish_reason: Some(reason.to_string()),
+                logprobs: None,
             }],
         }
     }
@@ -274,6 +309,7 @@ impl ChatCompletionChunk {
                 index: 0,
                 delta: Delta { role: Some("assistant".into()), content: None, tool_calls: Some(tool_calls) },
                 finish_reason: Some("tool_calls".to_string()),
+                logprobs: None,
             }],
         }
     }
@@ -284,6 +320,8 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<LogprobsInfo>,
 }
 
 #[derive(Debug, Serialize)]

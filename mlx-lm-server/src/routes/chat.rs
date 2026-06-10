@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::error::MlxError;
 use crate::mlx_service::{MlxService, MAX_MESSAGE_TOKENS};
-use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent, SamplerParams, StopSequence, TokenizeRequest, TokenizeResponse, Tool, ToolCall, Usage};
+use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, LogprobsInfo, MessageContent, SamplerParams, StopSequence, TokenizeRequest, TokenizeResponse, TokenLogprob, TopLogprob, Tool, ToolCall, Usage};
 use crate::state::AppState;
 
 pub async fn chat_completions(
@@ -110,6 +110,9 @@ pub async fn chat_completions(
         Some(StopSequence::Multiple(v)) => v.clone(),
         None => vec![],
     };
+    let want_logprobs = req.logprobs.unwrap_or(false);
+    let top_n_logprobs = req.top_logprobs.unwrap_or(0);
+    let seed = req.seed;
 
     let permit = match state.inference_sem.clone().acquire_owned().await {
         Ok(p) => p,
@@ -118,9 +121,9 @@ pub async fn chat_completions(
     };
 
     if req.stream.unwrap_or(false) {
-        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, permit).await
+        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, permit).await
     } else {
-        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, permit).await
+        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, permit).await
     }
 }
 
@@ -136,13 +139,16 @@ async fn sync_response(
     adapter_name: Option<String>,
     tools: Option<Vec<Tool>>,
     stop_strings: Vec<String>,
+    want_logprobs: bool,
+    top_n_logprobs: u32,
+    seed: Option<u64>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     info!("Generating sync response for model {}", model_name);
 
-    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings).await {
-        Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason)) => {
+    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed).await {
+        Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list)) => {
             let usage = Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
             let mut resp = if !tool_calls.is_empty() {
                 ChatCompletionResponse::with_tool_calls(MlxService::new_chat_id(), model_name, tool_calls, usage)
@@ -151,6 +157,20 @@ async fn sync_response(
             };
             if let Some(choice) = resp.choices.first_mut() {
                 choice.finish_reason = Some(finish_reason);
+                if let Some(lps) = lp_list {
+                    choice.logprobs = Some(LogprobsInfo {
+                        content: lps.into_iter().map(|v| TokenLogprob {
+                            token: v["token"].as_str().unwrap_or("").to_string(),
+                            logprob: v["logprob"].as_f64().unwrap_or(0.0) as f32,
+                            bytes: None,
+                            top_logprobs: v["top_logprobs"].as_array().unwrap_or(&vec![]).iter().map(|t| TopLogprob {
+                                token: t["token"].as_str().unwrap_or("").to_string(),
+                                logprob: t["logprob"].as_f64().unwrap_or(0.0) as f32,
+                                bytes: None,
+                            }).collect(),
+                        }).collect(),
+                    });
+                }
             }
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -163,6 +183,7 @@ async fn sync_response(
 
 const TOOL_SENTINEL: &str = "\x00TOOL_CALLS:";
 const FINISH_SENTINEL: &str = "\x00FINISH:";
+const LP_SENTINEL: &str = "\x00LP:";
 
 async fn stream_response(
     state: AppState,
@@ -176,6 +197,9 @@ async fn stream_response(
     adapter_name: Option<String>,
     tools: Option<Vec<Tool>>,
     stop_strings: Vec<String>,
+    want_logprobs: bool,
+    top_n_logprobs: u32,
+    seed: Option<u64>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
@@ -183,7 +207,7 @@ async fn stream_response(
     let timeout = state.config.stream_timeout;
 
     let token_stream = match state.mlx.generate_stream(
-        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings,
+        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -195,6 +219,8 @@ async fn stream_response(
     // Shared finish_reason updated when sentinel arrives; used in final stop chunk
     let finish_reason = std::sync::Arc::new(std::sync::Mutex::new("stop".to_string()));
     let finish_reason_w = finish_reason.clone();
+    // Pending logprob for the next text token
+    let mut pending_lp: Option<LogprobsInfo> = None;
 
     let sse_stream = token_stream.map(move |result| -> Result<Bytes, std::io::Error> {
         let data = match result {
@@ -210,6 +236,21 @@ async fn stream_response(
                     }
                     return Ok(Bytes::new());
                 }
+                if token.starts_with(LP_SENTINEL) {
+                    // Parse and buffer logprob for the next token
+                    let json_part = token.trim_start_matches(LP_SENTINEL).trim_end_matches('\x00');
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_part) {
+                        let tok = v["token"].as_str().unwrap_or("").to_string();
+                        let lp = v["logprob"].as_f64().unwrap_or(0.0) as f32;
+                        let top = v["top_logprobs"].as_array().unwrap_or(&vec![]).iter().map(|t| TopLogprob {
+                            token: t["token"].as_str().unwrap_or("").to_string(),
+                            logprob: t["logprob"].as_f64().unwrap_or(0.0) as f32,
+                            bytes: None,
+                        }).collect();
+                        pending_lp = Some(LogprobsInfo { content: vec![TokenLogprob { token: tok, logprob: lp, bytes: None, top_logprobs: top }] });
+                    }
+                    return Ok(Bytes::new());
+                }
                 if token.starts_with(TOOL_SENTINEL) {
                     let json_part = token
                         .trim_start_matches(TOOL_SENTINEL)
@@ -218,7 +259,8 @@ async fn stream_response(
                     let chunk = ChatCompletionChunk::tool_calls_chunk(&chat_id_clone, &model_clone, tool_calls);
                     serde_json::to_string(&chunk).unwrap_or_default()
                 } else {
-                    let chunk = ChatCompletionChunk::token(&chat_id_clone, &model_clone, &token, first);
+                    let lp = pending_lp.take();
+                    let chunk = ChatCompletionChunk::token_lp(&chat_id_clone, &model_clone, &token, first, lp);
                     first = false;
                     serde_json::to_string(&chunk).unwrap_or_default()
                 }
