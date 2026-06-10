@@ -247,6 +247,10 @@ impl ChatCompletionChunk {
     }
 
     pub fn stop(id: &str, model: &str) -> Self {
+        Self::finish(id, model, "stop")
+    }
+
+    pub fn finish(id: &str, model: &str, reason: &str) -> Self {
         Self {
             id: id.to_string(),
             object: "chat.completion.chunk",
@@ -255,7 +259,7 @@ impl ChatCompletionChunk {
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: Delta { role: None, content: None, tool_calls: None },
-                finish_reason: Some("stop".into()),
+                finish_reason: Some(reason.to_string()),
             }],
         }
     }

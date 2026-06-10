@@ -295,12 +295,15 @@ impl MlxService {
         kv_group_size: Option<u32>,
         adapter_name: Option<String>,
         tools: Option<Vec<Tool>>,
-    ) -> Result<(String, usize, usize, Vec<ToolCall>), MlxError> {
+        stop_strings: Vec<String>,
+    ) -> Result<(String, usize, usize, Vec<ToolCall>, String), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> PyResult<(String, usize, usize, Vec<ToolCall>)> {
+            Python::with_gil(|py| -> PyResult<(String, usize, usize, Vec<ToolCall>, String)> {
+                // Ensure Metal stream is initialized on this thread before any GPU ops
+                let _ = py.import("mlx.core").and_then(|mx| mx.call_method0("synchronize"));
                 let tokenizer = tokenizer_py.as_ref(py);
                 let windowed = apply_sliding_window(messages, MAX_WINDOW_TOKENS, py, tokenizer);
                 let prompt = apply_chat_template(py, tokenizer, &windowed, &chat_template_kwargs, tools.as_deref())?;
@@ -326,10 +329,24 @@ impl MlxService {
                 if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                 if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
-                let response: String = mlx_lm
+                let mut response: String = mlx_lm
                     .getattr("generate")?
                     .call((model_py.as_ref(py), tokenizer), Some(kwargs))?
                     .extract()?;
+
+                // Apply stop strings: truncate at first occurrence
+                let mut finish_reason = if count_tokens(py, tokenizer, &response) >= max_tokens {
+                    "length".to_string()
+                } else {
+                    "stop".to_string()
+                };
+                for stop in &stop_strings {
+                    if let Some(idx) = response.find(stop.as_str()) {
+                        response.truncate(idx);
+                        finish_reason = "stop".to_string();
+                        break;
+                    }
+                }
 
                 let completion_tokens = count_tokens(py, tokenizer, &response);
                 let parsed_tool_calls = if tools.is_some() {
@@ -337,9 +354,10 @@ impl MlxService {
                 } else {
                     vec![]
                 };
-                // If tool calls were parsed, the content is just the raw model output;
-                // callers check tool_calls.is_empty() to decide finish_reason.
-                Ok((response, prompt_tokens, completion_tokens, parsed_tool_calls))
+                if !parsed_tool_calls.is_empty() {
+                    finish_reason = "tool_calls".to_string();
+                }
+                Ok((response, prompt_tokens, completion_tokens, parsed_tool_calls, finish_reason))
             })
         })
         .await
@@ -360,6 +378,7 @@ impl MlxService {
         kv_group_size: Option<u32>,
         adapter_name: Option<String>,
         tools: Option<Vec<Tool>>,
+        stop_strings: Vec<String>,
     ) -> Result<ReceiverStream<Result<String, MlxError>>, MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
@@ -368,6 +387,8 @@ impl MlxService {
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| {
                 let run = || -> PyResult<()> {
+                    // Ensure Metal stream is initialized on this thread before any GPU ops
+                    let _ = py.import("mlx.core").and_then(|mx| mx.call_method0("synchronize"));
                     let tokenizer = tokenizer_py.as_ref(py);
                     let windowed = apply_sliding_window(messages, MAX_WINDOW_TOKENS, py, tokenizer);
                     let prompt =
@@ -397,41 +418,98 @@ impl MlxService {
                         .getattr("stream_generate")?
                         .call((model_py.as_ref(py), tokenizer), Some(kwargs))?;
 
-                    // When tools are provided, buffer full output and emit tool calls at end.
-                    // For regular streaming, emit tokens as they arrive.
+                    // When tools are provided, buffer full output to parse tool calls at end.
                     let has_tools = tools.is_some();
-                    let mut full_output = if has_tools { Some(String::new()) } else { None };
+                    let mut full_output: Option<String> = if has_tools { Some(String::new()) } else { None };
+                    // For stop string detection we need to track accumulated text.
+                    // We keep a rolling tail of len = max stop string length to catch
+                    // stop strings that span token boundaries.
+                    let max_stop_len = stop_strings.iter().map(|s| s.len()).max().unwrap_or(0);
+                    let mut accumulated = String::new();
+                    let mut emitted_len = 0usize; // bytes of accumulated already sent
+                    let mut finish_reason = "stop".to_string();
+                    let mut stop_hit = false;
 
                     let start = Instant::now();
-                    for item in generator.iter()? {
+                    'gen: for item in generator.iter()? {
                         if start.elapsed().as_secs_f64() > timeout_secs {
                             warn!("Stream timeout exceeded");
                             let _ = tx.blocking_send(Err(MlxError::Timeout));
                             return Ok(());
                         }
-                        let text: String = item?.getattr("text")?.extract()?;
+                        let response = item?;
+                        let text: String = response.getattr("text")?.extract()?;
+                        let fr: Option<String> = response.getattr("finish_reason")
+                            .and_then(|v| if v.is_none() { Err(pyo3::exceptions::PyAttributeError::new_err("")) } else { v.extract() })
+                            .ok();
+                        if let Some(r) = fr {
+                            finish_reason = r;
+                        }
+
                         if let Some(ref mut buf) = full_output {
                             buf.push_str(&text);
-                        } else if tx.blocking_send(Ok(text)).is_err() {
-                            break;
+                            continue;
+                        }
+
+                        // Stop string detection on accumulated text
+                        if !stop_strings.is_empty() {
+                            accumulated.push_str(&text);
+                            for stop in &stop_strings {
+                                if let Some(idx) = accumulated.find(stop.as_str()) {
+                                    // Emit everything before the stop string that hasn't been sent
+                                    if idx > emitted_len {
+                                        let to_emit = accumulated[emitted_len..idx].to_string();
+                                        if !to_emit.is_empty() {
+                                            let _ = tx.blocking_send(Ok(to_emit));
+                                        }
+                                    }
+                                    finish_reason = "stop".to_string();
+                                    stop_hit = true;
+                                    break 'gen;
+                                }
+                            }
+                            // Safe to emit up to (accumulated.len() - max_stop_len) bytes
+                            // to avoid emitting part of a potential future stop string
+                            let safe_end = accumulated.len().saturating_sub(max_stop_len);
+                            if safe_end > emitted_len {
+                                let to_emit = accumulated[emitted_len..safe_end].to_string();
+                                emitted_len = safe_end;
+                                if !to_emit.is_empty() && tx.blocking_send(Ok(to_emit)).is_err() {
+                                    break;
+                                }
+                            }
+                        } else {
+                            if tx.blocking_send(Ok(text)).is_err() {
+                                break;
+                            }
                         }
                     }
 
-                    // After full generation, parse and emit tool calls as a sentinel token
+                    // Flush any remaining buffered text (stop strings path, only if no stop was hit)
+                    if !stop_strings.is_empty() && full_output.is_none() && !stop_hit && emitted_len < accumulated.len() {
+                        let remainder = accumulated[emitted_len..].to_string();
+                        if !remainder.is_empty() {
+                            let _ = tx.blocking_send(Ok(remainder));
+                        }
+                    }
+
+                    // Tool calls path: parse and emit sentinel
                     if let Some(buf) = full_output {
                         let tool_calls = parse_tool_calls(py, tokenizer, &buf).unwrap_or_default();
                         if !tool_calls.is_empty() {
-                            // Encode tool calls as JSON sentinel for the stream handler to pick up
                             let sentinel = format!(
                                 "\x00TOOL_CALLS:{}\x00",
                                 serde_json::to_string(&tool_calls).unwrap_or_default()
                             );
                             let _ = tx.blocking_send(Ok(sentinel));
+                            finish_reason = "tool_calls".to_string();
                         } else {
-                            // No tool calls detected — emit content normally
                             let _ = tx.blocking_send(Ok(buf));
                         }
                     }
+
+                    // Emit finish_reason sentinel for the stream handler
+                    let _ = tx.blocking_send(Ok(format!("\x00FINISH:{}\x00", finish_reason)));
                     Ok(())
                 };
 
