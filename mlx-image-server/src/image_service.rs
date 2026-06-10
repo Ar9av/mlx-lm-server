@@ -67,6 +67,52 @@ impl ImageService {
                 }
 
                 let flux = flux_mod.getattr("Flux1")?.call((), Some(kwargs))?;
+
+                // Fix compatibility with community pre-quantized models saved by older mflux:
+                // those versions left certain layers (embeddings, x_embedder) as bfloat16
+                // instead of quantizing them. Current mflux wraps ALL layers as Quantized*,
+                // then loads the bfloat16 weights into a uint32-expecting slot.
+                // Scan all Quantized* layers and replace any with bfloat16 weights with
+                // their plain counterparts (Embedding or Linear).
+                let locals = pyo3::types::PyDict::new(py);
+                locals.set_item("flux", flux.clone())?;
+                py.run(
+                    "
+import mlx.core as mx, mlx.nn as nn
+
+def set_nested(root, path, mod):
+    parts = path.split('.')
+    obj = root
+    for p in parts[:-1]:
+        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    last = parts[-1]
+    if last.isdigit(): obj[int(last)] = mod
+    else: setattr(obj, last, mod)
+
+for path, module in flux.named_modules():
+    if not isinstance(module, (nn.QuantizedEmbedding, nn.QuantizedLinear)):
+        continue
+    w = module['weight']
+    if w.dtype == mx.uint32:
+        continue  # correctly quantized
+    w_bf16 = mx.array(w.astype(mx.bfloat16))
+    if isinstance(module, nn.QuantizedEmbedding):
+        new_mod = nn.Embedding(w_bf16.shape[0], w_bf16.shape[1])
+        new_mod.load_weights([('weight', w_bf16)])
+    else:
+        # QuantizedLinear: weight shape is (out, in), reconstruct as Linear
+        has_bias = 'bias' in dict(module.parameters())
+        new_mod = nn.Linear(w_bf16.shape[1], w_bf16.shape[0], bias=has_bias)
+        wts = [('weight', w_bf16)]
+        if has_bias:
+            wts.append(('bias', mx.array(module['bias'].astype(mx.bfloat16))))
+        new_mod.load_weights(wts)
+    set_nested(flux, path, new_mod)
+",
+                    None,
+                    Some(locals),
+                )?;
+
                 Ok(flux.into())
             })
         })
