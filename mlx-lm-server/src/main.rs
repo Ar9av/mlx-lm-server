@@ -89,6 +89,8 @@ async fn main() {
         .route("/api/models/local/:org/*model", delete(routes::models::delete_local_model))
         .route("/api/huggingface/models", get(routes::models::search_hf_models))
         .route("/api/ps", get(routes::models::ps))
+        // Prompt cache sessions
+        .route("/v1/sessions/:session_id", delete(routes::chat::delete_session))
         // Benchmarking
         .route("/v1/benchmark", post(routes::benchmark::run_benchmark))
         // Middleware

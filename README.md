@@ -41,6 +41,10 @@ mlx-lm ships a built-in Python server. This project wraps it in a Rust HTTP laye
 | Built-in benchmarking (TTFT + tok/s percentiles) | ❌ | ✅ |
 | HuggingFace Hub model search | ❌ | ✅ |
 | Ollama `/api/ps` compat | ❌ | ✅ |
+| Logprobs (`logprobs` + `top_logprobs`) | ❌ | ✅ |
+| Seed (`seed`) | ❌ | ✅ |
+| Stop sequences (`stop`) | ❌ | ✅ single string or array |
+| Prompt cache (session-based KV reuse) | ❌ | ✅ `session_id` param |
 
 ### Model & adapter lifecycle
 
@@ -116,6 +120,10 @@ OpenAI-compatible LLM inference powered by [mlx-lm](https://github.com/ml-explor
 - **Speculative decoding** — pass `drafter` in load request, `num_draft_tokens` per request
 - **KV-cache quantization** — `kv_bits` + `kv_group_size` per request
 - **Full sampler control** — `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`
+- **Stop sequences** — `stop` accepts a string or array; finish_reason reflects whether a stop string or length limit was hit
+- **Logprobs** — `logprobs: true` + `top_logprobs: N` returns per-token log probabilities and top-N alternatives
+- **Seed** — `seed` for reproducible outputs
+- **Prompt cache** — `session_id` enables KV-cache reuse across multi-turn requests; `DELETE /v1/sessions/:id` frees it
 - **Tool use / function calling** — `tools` + `tool_choice` in any chat request; auto-detects model's tool parser (Llama-3, Qwen, Mistral, Gemma, etc.)
 - **Benchmarking** (`POST /v1/benchmark`) — TTFT/tps percentiles
 - **Model info** (`GET /v1/models/:id/info`) — scans HF cache, reads config.json
@@ -124,9 +132,9 @@ OpenAI-compatible LLM inference powered by [mlx-lm](https://github.com/ml-explor
 - **Adapter fuse** (`POST /v1/adapters/:name/fuse`) — merge adapter weights into base model
 - **Model convert** (`POST /v1/convert`) — convert GGUF or HuggingFace models to MLX format
 
-### Sampler parameters
+### Request parameters
 
-All generation endpoints accept the full set of mlx-lm sampling params:
+All chat completion parameters:
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -140,6 +148,11 @@ All generation endpoints accept the full set of mlx-lm sampling params:
 | `num_draft_tokens` | int | Speculative decoding draft steps (requires drafter model) |
 | `kv_bits` | int | KV-cache quantization bits (4 or 8) |
 | `kv_group_size` | int | KV-cache quantization group size |
+| `stop` | string \| array | Stop generation at this string (or first match in array) |
+| `seed` | int | RNG seed for reproducible outputs |
+| `logprobs` | bool | Return per-token log probabilities |
+| `top_logprobs` | int | Number of top-token alternatives per position (requires `logprobs: true`) |
+| `session_id` | string | Reuse KV cache across requests with the same ID (prompt cache) |
 
 ### Benchmarks
 
@@ -196,6 +209,43 @@ curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"llama","messages":[{"role":"user","content":"Hello"}],
        "temperature":0.8,"top_k":50,"repetition_penalty":1.1}'
+
+# Stop sequences — stop at first match, finish_reason reflects it
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama","messages":[{"role":"user","content":"List items:"}],
+       "stop":["3.","END"]}'
+
+# Seed — reproducible outputs
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama","messages":[{"role":"user","content":"Pick a number"}],
+       "seed":42,"temperature":1.0}'
+
+# Logprobs — per-token log probabilities + top-5 alternatives
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama","messages":[{"role":"user","content":"Say hi"}],
+       "logprobs":true,"top_logprobs":5}'
+# → choices[0].logprobs.content[*].logprob  (chosen token)
+# → choices[0].logprobs.content[*].top_logprobs  (top-5 alternatives)
+
+# Prompt cache — reuse KV cache across a multi-turn session
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama","messages":[{"role":"user","content":"My name is Alice."}],
+       "session_id":"conv-1"}'
+
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama","messages":[{"role":"user","content":"My name is Alice."},
+       {"role":"assistant","content":"Hello Alice!"},
+       {"role":"user","content":"What is my name?"}],
+       "session_id":"conv-1"}'
+# Second request skips re-encoding the shared prefix
+
+# Free the session KV cache when done
+curl -X DELETE http://localhost:8080/v1/sessions/conv-1
 
 # Speculative decoding (load drafter first, then per-request control)
 curl -X POST http://localhost:8080/v1/models/load \

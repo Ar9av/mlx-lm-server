@@ -312,3 +312,11 @@ pub async fn tokenize(
         Err(e) => e.into_response(),
     }
 }
+
+pub async fn delete_session(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    state.mlx.delete_prompt_session(&session_id).await;
+    (StatusCode::OK, Json(serde_json::json!({"deleted": session_id}))).into_response()
+}
