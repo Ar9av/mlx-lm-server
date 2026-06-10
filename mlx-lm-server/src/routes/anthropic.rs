@@ -92,7 +92,7 @@ async fn sync_messages(
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> axum::response::Response {
     info!("Anthropic sync message for model {}", model_name);
-    match state.mlx.generate_response(messages, max_tokens, sampler, serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name, None, vec![], false, 0, None).await {
+    match state.mlx.generate_response(messages, max_tokens, sampler, serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name, None, vec![], false, 0, None, None).await {
         Ok((content, prompt_tokens, completion_tokens, _tool_calls, _finish_reason, _lp)) => {
             let resp = AnthropicResponse::new(
                 MlxService::new_msg_id(),
@@ -121,9 +121,9 @@ async fn stream_messages(
     let msg_id = MlxService::new_msg_id();
     let timeout = state.config.stream_timeout;
 
-    let token_stream = match state.mlx.generate_stream(
+    let (token_stream, _) = match state.mlx.generate_stream(
         messages, max_tokens, sampler, timeout,
-        serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name, None, vec![], false, 0, None,
+        serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name, None, vec![], false, 0, None, None,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),

@@ -64,8 +64,9 @@ pub async fn run_benchmark(
             false,
             0,
             None,
+            None,
         ).await {
-            Ok(mut stream) => {
+            Ok((mut stream, _)) => {
                 use tokio_stream::StreamExt;
                 let mut first_token = true;
                 let mut token_count = 0usize;

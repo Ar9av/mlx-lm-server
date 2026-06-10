@@ -34,9 +34,15 @@ struct MountedAdapter {
     mounted_at: u64,
 }
 
+struct PromptSession {
+    kv_cache: Py<PyAny>, // Python List[KVCache]
+    cached_tokens: usize,
+}
+
 struct Inner {
     loaded: Option<LoadedModel>,
     adapters: HashMap<String, MountedAdapter>,
+    prompt_sessions: HashMap<String, PromptSession>,
 }
 
 #[derive(Clone)]
@@ -48,7 +54,7 @@ pub struct MlxService {
 impl MlxService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner { loaded: None, adapters: HashMap::new() })),
+            inner: Arc::new(Mutex::new(Inner { loaded: None, adapters: HashMap::new(), prompt_sessions: HashMap::new() })),
             config,
         }
     }
@@ -183,6 +189,59 @@ impl MlxService {
         }
     }
 
+    /// Retrieve existing session cache (if any) or create a new empty one.
+    async fn get_or_create_session_cache(
+        &self,
+        session_id: &str,
+        model_py: Py<PyAny>,
+    ) -> (Py<PyAny>, usize) {
+        {
+            let guard = self.inner.lock().await;
+            if let Some(s) = guard.prompt_sessions.get(session_id) {
+                let cache_clone = Python::with_gil(|py| s.kv_cache.clone_ref(py));
+                return (cache_clone, s.cached_tokens);
+            }
+        }
+        // Create a new empty KV cache for this session
+        let cache_opt = tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+                let cache_mod = py.import("mlx_lm.models.cache")?;
+                let kv = cache_mod.call_method1("make_prompt_cache", (model_py.as_ref(py),))?;
+                Ok(kv.into())
+            })
+        })
+        .await;
+        match cache_opt {
+            Ok(Ok(cache)) => (cache, 0),
+            _ => {
+                // Fallback: return a dummy that will be ignored
+                Python::with_gil(|py| (py.None(), 0))
+            }
+        }
+    }
+
+    /// Store updated session after generation (offset read from Python cache object).
+    pub async fn commit_session(&self, session_id: String, kv_cache: Py<PyAny>) {
+        let cache_for_read = Python::with_gil(|py| kv_cache.clone_ref(py));
+        let offset = tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> usize {
+                let locals = pyo3::types::PyDict::new(py);
+                let _ = locals.set_item("cache", cache_for_read.as_ref(py));
+                py.eval("cache[0].offset", None, Some(&locals))
+                    .and_then(|v| v.extract::<usize>())
+                    .unwrap_or(0)
+            })
+        })
+        .await
+        .unwrap_or(0);
+        let mut guard = self.inner.lock().await;
+        guard.prompt_sessions.insert(session_id, PromptSession { kv_cache, cached_tokens: offset });
+    }
+
+    pub async fn delete_prompt_session(&self, session_id: &str) {
+        self.inner.lock().await.prompt_sessions.remove(session_id);
+    }
+
     pub async fn tokenize(&self, text: String) -> Result<Vec<i64>, MlxError> {
         let (_, tokenizer_py, _) = self.get_model_refs().await?;
         tokio::task::spawn_blocking(move || {
@@ -299,8 +358,21 @@ impl MlxService {
         want_logprobs: bool,
         top_n_logprobs: u32,
         seed: Option<u64>,
+        session_id: Option<String>,
     ) -> Result<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
+
+        // Get or create session KV cache
+        let session_cache = if let Some(ref sid) = session_id {
+            let model_py_for_cache = Python::with_gil(|py| model_py.clone_ref(py));
+            let (cache, offset) = self.get_or_create_session_cache(sid, model_py_for_cache).await;
+            Some((cache, offset))
+        } else {
+            None
+        };
+        // Clone handles for use inside spawn_blocking; original retained for post-generation commit
+        let session_cache_for_spawn: Option<(Py<PyAny>, usize)> = session_cache.as_ref()
+            .map(|(cache, offset)| (Python::with_gil(|py| cache.clone_ref(py)), *offset));
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
@@ -323,7 +395,6 @@ impl MlxService {
                 }
 
                 let kwargs = PyDict::new(py);
-                kwargs.set_item("prompt", &prompt)?;
                 kwargs.set_item("max_tokens", max_tokens as i64)?;
                 kwargs.set_item("sampler", py_sampler)?;
                 if let Some(bits) = kv_bits {
@@ -338,6 +409,23 @@ impl MlxService {
                 }
                 if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                 if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
+
+                // Set up prompt and optional KV cache
+                if let Some((ref kv_cache, cached_offset)) = session_cache_for_spawn {
+                    // Tokenize full prompt to find delta beyond cached tokens
+                    let mx = py.import("mlx.core")?;
+                    let all_ids: Vec<i64> = tokenizer.call_method1("encode", (&prompt,))?.extract()?;
+                    let delta_ids = if cached_offset > 0 && cached_offset < all_ids.len() {
+                        all_ids[cached_offset..].to_vec()
+                    } else {
+                        all_ids
+                    };
+                    let delta_arr = mx.call_method1("array", (delta_ids,))?;
+                    kwargs.set_item("prompt", delta_arr)?;
+                    kwargs.set_item("prompt_cache", kv_cache.as_ref(py))?;
+                } else {
+                    kwargs.set_item("prompt", &prompt)?;
+                }
 
                 let (mut response, mut finish_reason, mut lp_list) = if want_logprobs {
                     // Use stream_generate to collect per-token logprobs
@@ -419,6 +507,11 @@ impl MlxService {
         .map_err(|e| MlxError::Internal(e.to_string()))?
         .map_err(|e: PyErr| MlxError::Python(e.to_string()))?;
 
+        // Update session KV cache (in-place mutation happened in Python)
+        if let (Some(sid), Some((kv_cache, _))) = (session_id, session_cache) {
+            self.commit_session(sid, kv_cache).await;
+        }
+
         Ok(result)
     }
 
@@ -437,8 +530,21 @@ impl MlxService {
         want_logprobs: bool,
         top_n_logprobs: u32,
         seed: Option<u64>,
-    ) -> Result<ReceiverStream<Result<String, MlxError>>, MlxError> {
+        session_id: Option<String>,
+    ) -> Result<(ReceiverStream<Result<String, MlxError>>, Option<(String, Py<PyAny>, usize)>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
+
+        // Get or create session KV cache
+        let session_cache = if let Some(ref sid) = session_id {
+            let model_py_for_cache = Python::with_gil(|py| model_py.clone_ref(py));
+            let (cache, offset) = self.get_or_create_session_cache(sid, model_py_for_cache).await;
+            Some((cache, offset))
+        } else {
+            None
+        };
+        // Clone handles for use inside spawn_blocking; original retained for session_info return
+        let session_cache_for_spawn: Option<(Py<PyAny>, usize)> = session_cache.as_ref()
+            .map(|(cache, offset)| (Python::with_gil(|py| cache.clone_ref(py)), *offset));
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, MlxError>>(64);
 
@@ -455,8 +561,14 @@ impl MlxService {
                     let mlx_lm = py.import("mlx_lm")?;
                     let py_sampler = make_sampler(py, &sampler)?;
 
+                    // Apply seed before generation if provided
+                    if let Some(s) = seed {
+                        let _ = py.import("mlx.core").and_then(|mx| {
+                            mx.getattr("random")?.call_method1("seed", (s as i64,))
+                        });
+                    }
+
                     let kwargs = PyDict::new(py);
-                    kwargs.set_item("prompt", &prompt)?;
                     kwargs.set_item("max_tokens", max_tokens as i64)?;
                     kwargs.set_item("sampler", py_sampler)?;
                     if let Some(bits) = kv_bits {
@@ -472,11 +584,20 @@ impl MlxService {
                     if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                     if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
-                    // Apply seed before generation if provided
-                    if let Some(s) = seed {
-                        let _ = py.import("mlx.core").and_then(|mx| {
-                            mx.getattr("random")?.call_method1("seed", (s as i64,))
-                        });
+                    // Set up prompt with optional session KV cache
+                    if let Some((ref kv_cache, cached_offset)) = session_cache_for_spawn {
+                        let mx = py.import("mlx.core")?;
+                        let all_ids: Vec<i64> = tokenizer.call_method1("encode", (&prompt,))?.extract()?;
+                        let delta_ids = if cached_offset > 0 && cached_offset < all_ids.len() {
+                            all_ids[cached_offset..].to_vec()
+                        } else {
+                            all_ids
+                        };
+                        let delta_arr = mx.call_method1("array", (delta_ids,))?;
+                        kwargs.set_item("prompt", delta_arr)?;
+                        kwargs.set_item("prompt_cache", kv_cache.as_ref(py))?;
+                    } else {
+                        kwargs.set_item("prompt", &prompt)?;
                     }
 
                     let generator = mlx_lm
@@ -605,7 +726,9 @@ impl MlxService {
             });
         });
 
-        Ok(ReceiverStream::new(rx))
+        // Return stream + session info for the caller to commit after stream ends
+        let session_info = session_id.zip(session_cache).map(|(sid, (cache, _))| (sid, cache, 0usize));
+        Ok((ReceiverStream::new(rx), session_info))
     }
 
     pub async fn generate_vision_response(

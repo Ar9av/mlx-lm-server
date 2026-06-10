@@ -113,6 +113,7 @@ pub async fn chat_completions(
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_n_logprobs = req.top_logprobs.unwrap_or(0);
     let seed = req.seed;
+    let session_id = req.session_id.clone();
 
     let permit = match state.inference_sem.clone().acquire_owned().await {
         Ok(p) => p,
@@ -121,9 +122,9 @@ pub async fn chat_completions(
     };
 
     if req.stream.unwrap_or(false) {
-        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, permit).await
+        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit).await
     } else {
-        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, permit).await
+        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit).await
     }
 }
 
@@ -142,12 +143,13 @@ async fn sync_response(
     want_logprobs: bool,
     top_n_logprobs: u32,
     seed: Option<u64>,
+    session_id: Option<String>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     info!("Generating sync response for model {}", model_name);
 
-    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed).await {
+    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id).await {
         Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list)) => {
             let usage = Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
             let mut resp = if !tool_calls.is_empty() {
@@ -200,14 +202,15 @@ async fn stream_response(
     want_logprobs: bool,
     top_n_logprobs: u32,
     seed: Option<u64>,
+    session_id: Option<String>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     let chat_id = MlxService::new_chat_id();
     let timeout = state.config.stream_timeout;
 
-    let token_stream = match state.mlx.generate_stream(
-        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed,
+    let (token_stream, session_info) = match state.mlx.generate_stream(
+        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -272,6 +275,7 @@ async fn stream_response(
         Ok(Bytes::from(format!("data: {}\n\n", data)))
     });
 
+    let mlx_svc = state.mlx.clone();
     let combined = sse_stream.chain(futures::stream::once(async move {
         let reason = finish_reason.lock().map(|g| g.clone()).unwrap_or_else(|_| "stop".into());
         let final_chunk = ChatCompletionChunk::finish(&chat_id, &model_name, &reason);
@@ -280,6 +284,10 @@ async fn stream_response(
             serde_json::to_string(&final_chunk).unwrap_or_default()
         );
         drop(permit);
+        // Commit session KV cache after stream ends (Python mutated it in-place)
+        if let Some((sid, kv_cache, _)) = session_info {
+            mlx_svc.commit_session(sid, kv_cache).await;
+        }
         Ok::<Bytes, std::io::Error>(Bytes::from(final_data))
     }));
 

@@ -165,6 +165,7 @@ pub struct ChatCompletionRequest {
     pub logprobs: Option<bool>,
     pub top_logprobs: Option<u32>,
     pub seed: Option<u64>,
+    pub session_id: Option<String>,
     #[serde(default)]
     pub chat_template_kwargs: serde_json::Value,
     pub kv_bits: Option<u32>,
