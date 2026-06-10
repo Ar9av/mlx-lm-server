@@ -6,6 +6,7 @@ A monorepo of OpenAI-compatible inference servers for Apple Silicon, written in 
 |---|---|---|
 | [`mlx-lm-server`](./mlx-lm-server) | LLM chat completions, Anthropic compat, LoRA adapters, vision | `8080` |
 | [`mlx-audio-server`](./mlx-audio-server) | TTS, STT, audio translation, source separation | `8001` |
+| [`mlx-image-server`](./mlx-image-server) | FLUX.1 image generation (text-to-image) | `8002` |
 
 **Single binaries. ~8 MB idle RSS each. Drop-in replacement for OpenAI API.**
 
@@ -98,6 +99,9 @@ Multiple adapters can be mounted simultaneously on the same base model, each rea
 
 # Audio server  →  http://localhost:8001
 ./run.sh audio
+
+# Image server  →  http://localhost:8002
+./run.sh image
 
 # Force rebuild after Rust changes
 BUILD=1 ./run.sh lm
@@ -287,6 +291,83 @@ curl -X POST http://localhost:8080/v1/convert \
   -H 'Content-Type: application/json' \
   -d '{"model":"bartowski/Llama-3.2-3B-Instruct-GGUF","output":"./mlx-llama3","quantize_bits":4}'
 ```
+
+---
+
+## mlx-image-server
+
+OpenAI-compatible image generation powered by [mflux](https://github.com/filipstrand/mflux) (FLUX.1 on Apple Silicon).
+
+### Features
+
+- **Text-to-image** (`POST /v1/images/generations`) — OpenAI-compatible, returns `b64_json` or data URI
+- **FLUX.1 schnell + dev** — fast 4-step schnell (default) or quality-focused dev
+- **Custom model path** — use any public HuggingFace repo (including pre-quantized community models)
+- **Quantization** — optional 4-bit or 8-bit weight quantization on load
+- **Full parameter control** — `size`, `steps`, `guidance`, `seed`, `negative_prompt`, `n`
+- **Auto-load** — model loads automatically on first generation request if not pre-loaded
+
+### Models
+
+The official FLUX.1 models (`black-forest-labs/FLUX.1-schnell`) require accepting the license at [huggingface.co/black-forest-labs/FLUX.1-schnell](https://huggingface.co/black-forest-labs/FLUX.1-schnell) and running `huggingface-cli login`.
+
+Alternatively, use a public pre-quantized community model — no auth required:
+
+| `model` | `model_path` | Size | Notes |
+|---|---|---|---|
+| `flux-schnell` | `madroid/flux.1-schnell-mflux-4bit` | ~3.4 GB | 4-bit, no auth required |
+| `flux-schnell` | *(none, needs HF auth)* | ~34 GB | bf16, then quantize locally |
+| `flux-dev` | *(none, needs HF auth)* | ~34 GB | higher quality, 20–50 steps |
+
+### API examples
+
+```bash
+# Load a public pre-quantized model (no HF auth needed)
+curl -X POST http://localhost:8002/v1/models/load \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "flux-schnell", "model_path": "madroid/flux.1-schnell-mflux-4bit"}'
+
+# Generate an image (b64_json response)
+curl http://localhost:8002/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "a red apple on a wooden table, photorealistic",
+    "size": "1024x1024",
+    "steps": 4,
+    "seed": 42
+  }' | python3 -c "
+import sys, json, base64
+r = json.load(sys.stdin)
+open('out.png','wb').write(base64.b64decode(r['data'][0]['b64_json']))
+print('Saved out.png')
+"
+
+# OpenAI Python SDK
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8002/v1", api_key="local")
+resp = client.images.generate(
+    model="flux-schnell",
+    prompt="a watercolor painting of a mountain lake at sunrise",
+    size="1024x1024",
+    n=1,
+)
+# resp.data[0].b64_json contains the PNG
+```
+
+### Request parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `prompt` | string | required | Text prompt |
+| `model` | string | `flux-schnell` | `flux-schnell` or `flux-dev` |
+| `size` | string | `1024x1024` | `WIDTHxHEIGHT`, e.g. `512x512`, `1024x768` |
+| `n` | int | `1` | Number of images (max 4) |
+| `response_format` | string | `b64_json` | `b64_json` or `url` (data URI) |
+| `steps` | int | `4` | Inference steps (4 for schnell, 20–50 for dev) |
+| `guidance` | float | `4.0` | Classifier-free guidance scale |
+| `seed` | int | random | RNG seed for reproducibility |
+| `negative_prompt` | string | — | Negative prompt (dev only) |
+| `quantize` | int | — | Quantize weights on load: `4` or `8` |
 
 ---
 

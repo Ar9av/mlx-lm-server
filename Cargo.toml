@@ -1,5 +1,5 @@
 [workspace]
-members = ["mlx-lm-server", "mlx-audio-server"]
+members = ["mlx-lm-server", "mlx-audio-server", "mlx-image-server"]
 resolver = "2"
 
 [workspace.package]

@@ -16,12 +16,13 @@ VENV="${VENV:-$REPO_ROOT/.venv}"
 
 MODE="${1:-}"
 case "$MODE" in
-  lm|audio) shift ;;
+  lm|audio|image) shift ;;
   *)
-    echo "Usage: $0 <lm|audio> [server-flags...]"
+    echo "Usage: $0 <lm|audio|image> [server-flags...]"
     echo ""
     echo "  lm     — OpenAI-compatible chat / completions server  (port 8080)"
     echo "  audio  — TTS / STT / STS server                       (port 8001)"
+    echo "  image  — FLUX.1 image generation server               (port 8002)"
     echo ""
     echo "Environment:"
     echo "  VENV=<path>   override venv location (default: \$REPO_ROOT/.venv)"
@@ -52,12 +53,18 @@ if [[ "$MODE" == "lm" ]]; then
   "$PYTHON" -m pip install -q mlx-lm
   CRATE="mlx-lm-server"
   BINARY="mlx-lm-server"
-else
+elif [[ "$MODE" == "audio" ]]; then
   echo "[setup] Installing audio deps ..."
   "$PYTHON" -m pip install -q --upgrade pip
   "$PYTHON" -m pip install -q mlx-audio numpy misaki num2words spacy phonemizer
   CRATE="mlx-audio-server"
   BINARY="mlx-audio-server"
+else
+  echo "[setup] Installing image deps ..."
+  "$PYTHON" -m pip install -q --upgrade pip
+  "$PYTHON" -m pip install -q mflux
+  CRATE="mlx-image-server"
+  BINARY="mlx-image-server"
 fi
 
 # ── build ─────────────────────────────────────────────────────────────────────
