@@ -1,22 +1,83 @@
 # mlx-local-server
 
-A monorepo of OpenAI-compatible inference servers for Apple Silicon, written in Rust. Both servers embed Python via [PyO3](https://pyo3.rs) — Metal acceleration stays in Python, everything else (HTTP, concurrency, streaming) runs natively in Rust.
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-black.svg)](https://www.apple.com/mac/)
 
-| Server | What it does | Default port |
+OpenAI-compatible inference servers for Apple Silicon — LLM, image generation, and audio — written in Rust with Python (MLX) for inference via [PyO3](https://pyo3.rs).
+
+**8 MB idle RAM. 16 ms cold start. Single binary.**
+
+| Server | Capability | Port |
 |---|---|---|
-| [`mlx-lm-server`](./mlx-lm-server) | LLM chat completions, Anthropic compat, LoRA adapters, vision | `8080` |
-| [`mlx-audio-server`](./mlx-audio-server) | TTS, STT, audio translation, source separation | `8001` |
-| [`mlx-image-server`](./mlx-image-server) | FLUX.1 image generation (text-to-image) | `8002` |
+| `mlx-lm-server` | Chat completions, embeddings, vision, LoRA, fine-tuning | `8080` |
+| `mlx-audio-server` | TTS, STT, audio translation, source separation | `8001` |
+| `mlx-image-server` | FLUX.2-klein text-to-image, 9s/image on M-series | `8002` |
 
-**Single binaries. ~8 MB idle RSS each. Drop-in replacement for OpenAI API.**
+> Showcased at [WWDC 2025 — Build local AI agents on Mac with MLX](https://developer.apple.com/videos/play/wwdc2025/).
 
-> Built with [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) — Apple's open-source ML framework for Apple Silicon. Showcased at [WWDC 2025 — Build local AI agents on Mac with MLX](https://developer.apple.com/videos/play/wwdc2025/).
+---
+
+## Prerequisites
+
+- Apple Silicon Mac (M1/M2/M3/M4/M5)
+- macOS 13+
+- Python 3.12 or 3.13
+- Rust 1.75+ — install via `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+
+```bash
+# Clone and set up Python env
+git clone https://github.com/Ar9av/mlx-lm-server
+cd mlx-lm-server
+python3 -m venv .venv
+source .venv/bin/activate
+pip install mlx mlx-lm mflux mlx-audio
+```
+
+---
+
+## Quick start
+
+```bash
+# LLM — chat completions on :8080
+./run.sh lm
+
+# Image generation — FLUX.2 on :8002
+./run.sh image
+
+# Audio (TTS/STT) on :8001
+./run.sh audio
+```
+
+Models are downloaded automatically on first use. Force a rebuild after Rust changes with `BUILD=1 ./run.sh lm`.
+
+### Try it
+
+```bash
+# Load a model
+curl -X POST http://localhost:8080/v1/models/load \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "mlx-community/Llama-3.2-3B-Instruct-4bit"}'
+
+# Chat
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Generate an image (downloads ~4 GB on first run, then cached)
+curl http://localhost:8002/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "a red apple on a table, photorealistic", "size": "1024x1024"}' \
+  | python3 -c "import sys,json,base64; open('out.png','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+```
+
+Works as a drop-in replacement for the OpenAI API — point any OpenAI SDK at `http://localhost:8080/v1`.
 
 ---
 
 ## Why not `python -m mlx_lm.server`?
 
-mlx-lm ships a built-in Python server. This project wraps it in a Rust HTTP layer and extends it significantly. Here's what's different:
+mlx-lm ships a built-in Python server. This wraps it in a Rust HTTP layer with significantly more surface area.
 
 ### Runtime
 
@@ -24,7 +85,7 @@ mlx-lm ships a built-in Python server. This project wraps it in a Rust HTTP laye
 |---|---|---|
 | Language | Python (uvicorn/starlette) | Rust (tokio + axum) |
 | Idle RSS | ~60–100 MB | **8 MB** |
-| Cold start | ~3–5 s (Python imports) | **16 ms** |
+| Cold start | ~3–5 s | **16 ms** |
 | Concurrency | asyncio + GIL contention | tokio async, GIL only during inference |
 | Deployment | needs Python env in PATH | single self-contained binary |
 
@@ -37,139 +98,82 @@ mlx-lm ships a built-in Python server. This project wraps it in a Rust HTTP laye
 | Embeddings | ❌ | ✅ |
 | Anthropic Messages API | ❌ | ✅ |
 | Vision routing (`mlx_vlm`) | ❌ | ✅ auto-detects `image_url` |
-| TTS / STT / source separation | ❌ | ✅ (mlx-audio-server) |
+| TTS / STT / source separation | ❌ | ✅ |
+| Image generation (FLUX.2) | ❌ | ✅ |
 | Tokenize endpoint | ❌ | ✅ |
-| Built-in benchmarking (TTFT + tok/s percentiles) | ❌ | ✅ |
-| HuggingFace Hub model search | ❌ | ✅ |
-| Ollama `/api/ps` compat | ❌ | ✅ |
-| Logprobs (`logprobs` + `top_logprobs`) | ❌ | ✅ |
-| Seed (`seed`) | ❌ | ✅ |
-| Stop sequences (`stop`) | ❌ | ✅ single string or array |
-| Prompt cache (session-based KV reuse) | ❌ | ✅ `session_id` param |
+| Built-in benchmarking | ❌ | ✅ |
+| HuggingFace model search | ❌ | ✅ |
+| Logprobs | ❌ | ✅ |
+| Seed | ❌ | ✅ |
+| Prompt cache (KV reuse) | ❌ | ✅ |
 
-### Model & adapter lifecycle
+### Model lifecycle
 
 | Feature | `mlx_lm.server` | mlx-local-server |
 |---|---|---|
 | Runtime load/unload without restart | ❌ | ✅ |
-| LoRA adapter hot-swap | single adapter at startup | ✅ multiple, per-request routing |
-| Speculative decoding | ❌ server-level | ✅ drafter model + per-request `num_draft_tokens` |
-| RAM guard (pre-load memory check) | ❌ | ✅ |
-| Model allowlist / size limit | ❌ | ✅ env vars |
-| Scan local HuggingFace cache | ❌ | ✅ |
+| LoRA adapter hot-swap | single at startup | ✅ multiple, per-request |
+| Speculative decoding | ❌ | ✅ per-request `num_draft_tokens` |
+| RAM guard | ❌ | ✅ |
 
 ### Sampler parameters
 
-`mlx_lm.server` exposes `temperature` and `top_p`. This server exposes all 8 mlx-lm sampling parameters — including `presence_penalty` and `frequency_penalty`, which exist in mlx-lm but were never wired through its built-in server:
+`mlx_lm.server` exposes `temperature` and `top_p`. This server exposes all 8:
 
 `temperature` · `top_p` · `top_k` · `min_p` · `repetition_penalty` · `presence_penalty` · `frequency_penalty` · `num_draft_tokens`
-
-### Fine-tuning workflow
-
-mlx-lm's CLI handles offline training via `mlx_lm.lora --train` and `mlx_lm.fuse`. This server wraps those same Python modules behind HTTP endpoints — train, fuse, and convert without leaving the API:
-
-```bash
-# 1. Train via API — streams SSE progress events while training runs
-curl http://localhost:8080/v1/train \
-  -d '{"model":"mlx-community/Llama-3.2-3B-Instruct-4bit",
-       "data":"./my-data","iters":1000,"adapter_path":"./my-adapter"}'
-
-# 2. Mount the trained adapter (no restart)
-curl -X POST http://localhost:8080/v1/adapters/mount \
-  -d '{"name":"my-lora","adapter_path":"./my-adapter"}'
-
-# 3. Route specific requests to it (per-request, same server)
-curl http://localhost:8080/v1/chat/completions \
-  -d '{"messages":[...],"adapter_name":"my-lora"}'
-
-# 4. Fuse adapter into base model when done iterating
-curl -X POST http://localhost:8080/v1/adapters/my-lora/fuse \
-  -d '{"adapter":"my-lora","output":"./fused-model"}'
-```
-
-Multiple adapters can be mounted simultaneously on the same base model, each reachable by name per request. `mlx_lm.lora --train` still works for offline training; the API is an additional option.
-
----
-
-## Quick start
-
-```bash
-# LLM server  →  http://localhost:8080
-./run.sh lm
-
-# Audio server  →  http://localhost:8001
-./run.sh audio
-
-# Image server  →  http://localhost:8002
-./run.sh image
-
-# Force rebuild after Rust changes
-BUILD=1 ./run.sh lm
-```
 
 ---
 
 ## mlx-lm-server
 
-OpenAI-compatible LLM inference powered by [mlx-lm](https://github.com/ml-explore/mlx-lm).
-
 ### Features
 
-- **OpenAI chat completions** (`POST /v1/chat/completions`) — streaming SSE + sync
-- **Anthropic messages** (`POST /v1/messages`) — streaming + sync
+- **Chat completions** (`POST /v1/chat/completions`) — streaming SSE + sync
+- **Anthropic messages** (`POST /v1/messages`)
 - **Text completions** (`POST /v1/completions`)
 - **Embeddings** (`POST /v1/embeddings`)
-- **Vision** — routes `image_url` messages to `mlx_vlm` automatically
-- **LoRA adapter hot-swap** (`GET/POST/DELETE /v1/adapters`)
-- **Speculative decoding** — pass `drafter` in load request, `num_draft_tokens` per request
-- **KV-cache quantization** — `kv_bits` + `kv_group_size` per request
-- **Full sampler control** — `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`
-- **Stop sequences** — `stop` accepts a string or array; finish_reason reflects whether a stop string or length limit was hit
-- **Logprobs** — `logprobs: true` + `top_logprobs: N` returns per-token log probabilities and top-N alternatives
-- **Seed** — `seed` for reproducible outputs
-- **Prompt cache** — `session_id` enables KV-cache reuse across multi-turn requests; `DELETE /v1/sessions/:id` frees it
-- **Tool use / function calling** — `tools` + `tool_choice` in any chat request; auto-detects model's tool parser (Llama-3, Qwen, Mistral, Gemma, etc.)
-- **Benchmarking** (`POST /v1/benchmark`) — TTFT/tps percentiles
-- **Model info** (`GET /v1/models/:id/info`) — scans HF cache, reads config.json
-- **RAM guard** — rejects loads that would exceed available memory
-- **Fine-tuning** (`POST /v1/train`) — LoRA / DoRA / full fine-tuning with SSE progress stream
-- **Adapter fuse** (`POST /v1/adapters/:name/fuse`) — merge adapter weights into base model
-- **Model convert** (`POST /v1/convert`) — convert GGUF or HuggingFace models to MLX format
-
-### Request parameters
-
-All chat completion parameters:
-
-| Parameter | Type | Description |
-|---|---|---|
-| `temperature` | float | Sampling temperature (default: 0.7) |
-| `top_p` | float | Nucleus sampling (default: 0.9) |
-| `top_k` | int | Top-K tokens to sample from |
-| `min_p` | float | Minimum probability threshold |
-| `repetition_penalty` | float | Penalty for repeated tokens |
-| `presence_penalty` | float | Penalise tokens already in context |
-| `frequency_penalty` | float | Penalise tokens by frequency |
-| `num_draft_tokens` | int | Speculative decoding draft steps (requires drafter model) |
-| `kv_bits` | int | KV-cache quantization bits (4 or 8) |
-| `kv_group_size` | int | KV-cache quantization group size |
-| `stop` | string \| array | Stop generation at this string (or first match in array) |
-| `seed` | int | RNG seed for reproducible outputs |
-| `logprobs` | bool | Return per-token log probabilities |
-| `top_logprobs` | int | Number of top-token alternatives per position (requires `logprobs: true`) |
-| `session_id` | string | Reuse KV cache across requests with the same ID (prompt cache) |
+- **Vision** — auto-routes `image_url` messages to `mlx_vlm`
+- **LoRA adapter hot-swap** — multiple adapters, per-request routing
+- **Speculative decoding** — pass `drafter` on load, `num_draft_tokens` per request
+- **KV-cache quantization** — `kv_bits` + `kv_group_size`
+- **Prompt cache** — `session_id` for KV-cache reuse across turns
+- **Tool use / function calling** — auto-detects model's parser (Llama-3, Qwen, Mistral, etc.)
+- **Logprobs** — `logprobs` + `top_logprobs`
+- **Fine-tuning** (`POST /v1/train`) — LoRA/DoRA with SSE progress stream
+- **Adapter fuse** (`POST /v1/adapters/:name/fuse`)
+- **Model convert** (`POST /v1/convert`) — GGUF or HF → MLX
 
 ### Benchmarks
 
-Tested on Apple M-series with `mlx-community/Llama-3.2-1B-Instruct-4bit`:
+Tested on Apple M-series, `mlx-community/Llama-3.2-1B-Instruct-4bit`:
 
 | Metric | Result |
 |---|---|
 | Cold start | 16 ms |
 | Model load (cached) | 2.4 s |
-| Idle memory (RSS) | 8 MB |
+| Idle RSS | 8 MB |
 | Throughput (streaming) | 115–261 tok/s |
 | Time to first token | 86–96 ms |
 | 4× concurrent requests | 0.37 s wall, 0 errors |
+
+### Request parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `temperature` | float | Sampling temperature (default: 0.7) |
+| `top_p` | float | Nucleus sampling (default: 0.9) |
+| `top_k` | int | Top-K sampling |
+| `min_p` | float | Minimum probability threshold |
+| `repetition_penalty` | float | Repeat penalty |
+| `presence_penalty` | float | Presence penalty |
+| `frequency_penalty` | float | Frequency penalty |
+| `num_draft_tokens` | int | Speculative decoding steps |
+| `kv_bits` | int | KV-cache quantization (4 or 8) |
+| `stop` | string \| array | Stop sequences |
+| `seed` | int | Reproducible outputs |
+| `logprobs` | bool | Per-token log probabilities |
+| `top_logprobs` | int | Top-N alternatives per token |
+| `session_id` | string | Prompt cache key |
 
 ### API examples
 
@@ -184,178 +188,97 @@ curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"llama","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
-# Tool use / function calling
+# Tool use
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "llama",
     "messages": [{"role":"user","content":"What is the weather in London?"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get the current weather for a location",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "location": {"type": "string", "description": "City name"},
-            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-          },
-          "required": ["location"]
-        }
-      }
-    }]
+    "tools": [{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]
   }'
-# → {"choices":[{"finish_reason":"tool_calls","tool_calls":[{"id":"call_abc123","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"London\"}"}}]}]}
 
-# Chat with sampler params
+# Prompt cache (reuse KV across turns)
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"llama","messages":[{"role":"user","content":"Hello"}],
-       "temperature":0.8,"top_k":50,"repetition_penalty":1.1}'
+  -d '{"model":"llama","messages":[{"role":"user","content":"My name is Alice."}],"session_id":"conv-1"}'
 
-# Stop sequences — stop at first match, finish_reason reflects it
-curl http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"llama","messages":[{"role":"user","content":"List items:"}],
-       "stop":["3.","END"]}'
-
-# Seed — reproducible outputs
-curl http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"llama","messages":[{"role":"user","content":"Pick a number"}],
-       "seed":42,"temperature":1.0}'
-
-# Logprobs — per-token log probabilities + top-5 alternatives
-curl http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"llama","messages":[{"role":"user","content":"Say hi"}],
-       "logprobs":true,"top_logprobs":5}'
-# → choices[0].logprobs.content[*].logprob  (chosen token)
-# → choices[0].logprobs.content[*].top_logprobs  (top-5 alternatives)
-
-# Prompt cache — reuse KV cache across a multi-turn session
-curl http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"llama","messages":[{"role":"user","content":"My name is Alice."}],
-       "session_id":"conv-1"}'
-
-curl http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"llama","messages":[{"role":"user","content":"My name is Alice."},
-       {"role":"assistant","content":"Hello Alice!"},
-       {"role":"user","content":"What is my name?"}],
-       "session_id":"conv-1"}'
-# Second request skips re-encoding the shared prefix
-
-# Free the session KV cache when done
+# Free session when done
 curl -X DELETE http://localhost:8080/v1/sessions/conv-1
 
-# Speculative decoding (load drafter first, then per-request control)
+# Speculative decoding
 curl -X POST http://localhost:8080/v1/models/load \
   -H 'Content-Type: application/json' \
-  -d '{"model":"mlx-community/Llama-3.2-3B-Instruct-4bit",
-       "drafter":"mlx-community/Llama-3.2-1B-Instruct-4bit"}'
+  -d '{"model":"mlx-community/Llama-3.2-3B-Instruct-4bit","drafter":"mlx-community/Llama-3.2-1B-Instruct-4bit"}'
 
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"llama","messages":[...],"num_draft_tokens":4}'
+  -d '{"model":"llama","messages":[{"role":"user","content":"Write a poem"}],"num_draft_tokens":4}'
 
-# Mount a LoRA adapter
-curl -X POST http://localhost:8080/v1/adapters/mount \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"my-lora","adapter_path":"/path/to/adapter","model":"mlx-community/Llama-3.2-3B-Instruct-4bit"}'
-
-# Fine-tune (LoRA) — streams SSE progress events
+# Fine-tune (streams SSE progress)
 curl http://localhost:8080/v1/train \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
-    "data": "./my-data",
-    "fine_tune_type": "lora",
-    "adapter_path": "./my-adapter",
-    "iters": 500,
-    "batch_size": 4,
-    "learning_rate": 1e-4
-  }'
-# data: {"event":"progress","message":"Training lora — 500 iters, lr=1e-4"}
-# data: {"event":"done","adapter_path":"./my-adapter","message":"Training complete"}
+  -d '{"model":"mlx-community/Llama-3.2-3B-Instruct-4bit","data":"./my-data","fine_tune_type":"lora","adapter_path":"./my-adapter","iters":500}'
 
 # Fuse adapter into base model
 curl -X POST http://localhost:8080/v1/adapters/my-lora/fuse \
   -H 'Content-Type: application/json' \
   -d '{"adapter":"my-lora","output":"./fused-model"}'
-
-# Convert GGUF or HF model to MLX (with optional quantization)
-curl -X POST http://localhost:8080/v1/convert \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"bartowski/Llama-3.2-3B-Instruct-GGUF","output":"./mlx-llama3","quantize_bits":4}'
 ```
 
 ---
 
 ## mlx-image-server
 
-OpenAI-compatible image generation powered by [mflux](https://github.com/filipstrand/mflux) (FLUX.1 on Apple Silicon).
+Text-to-image via [mflux](https://github.com/filipstrand/mflux), OpenAI-compatible.
+
+Default model: **FLUX.2-klein-4B** — 4-bit quantized, ~4 GB on disk, ~9 seconds per image on M-series.
+
+Pre-quantized weights (no setup needed): [ar9av/FLUX.2-klein-4B-mflux-4bit](https://huggingface.co/ar9av/FLUX.2-klein-4B-mflux-4bit)
 
 ### Features
 
-- **Text-to-image** (`POST /v1/images/generations`) — OpenAI-compatible, returns `b64_json` or data URI
-- **FLUX.1 schnell + dev** — fast 4-step schnell (default) or quality-focused dev
-- **Custom model path** — use any public HuggingFace repo (including pre-quantized community models)
-- **Quantization** — optional 4-bit or 8-bit weight quantization on load
-- **Full parameter control** — `size`, `steps`, `guidance`, `seed`, `negative_prompt`, `n`
-- **Auto-load** — model loads automatically on first generation request if not pre-loaded
+- **Text-to-image** (`POST /v1/images/generations`) — returns `b64_json` or data URI
+- **FLUX.2-klein** (default) and **FLUX.1-schnell/dev**
+- **Auto-quantize** — 4-bit on first load, no manual step
+- **Auto-load** — loads model on first request if none is loaded
+- **Full parameter control** — `size`, `steps`, `guidance`, `seed`, `n`
+
+### Quick start
+
+```bash
+# Start the server
+./run.sh image
+
+# Generate — model downloads automatically (~4 GB, then cached)
+curl http://localhost:8002/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "a futuristic city at night, cinematic", "size": "1024x1024"}' \
+  | python3 -c "import sys,json,base64; open('out.png','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+```
 
 ### Models
 
-This server uses **mflux 0.18+** which requires the official weights from Black Forest Labs. Community models saved with older mflux versions (e.g. `madroid/flux.1-schnell-mflux-4bit`) are **not compatible** — they use a different quantization format and will produce garbled output.
+| Model | Size (quantized) | Steps | Notes |
+|---|---|---|---|
+| `black-forest-labs/FLUX.2-klein-4B` | ~4 GB | 4 | **Default. Fast, no gate.** |
+| `black-forest-labs/FLUX.1-schnell` | ~9 GB | 4 | Requires HF gate acceptance |
+| `black-forest-labs/FLUX.1-dev` | ~9 GB | 20–50 | Higher quality, requires gate |
 
-**Setup (one-time):**
-1. Create a HuggingFace account at huggingface.co
-2. Visit [huggingface.co/black-forest-labs/FLUX.1-schnell](https://huggingface.co/black-forest-labs/FLUX.1-schnell) and click "Access repository" to accept the free license
-3. Run `huggingface-cli login` (or set `HUGGINGFACE_TOKEN` env var)
+For FLUX.1 models, accept the license at huggingface.co/black-forest-labs and run `huggingface-cli login`.
 
-On first use, mflux downloads (~34 GB) and caches the model. With `quantize=4`, the on-disk cache shrinks to ~9 GB and fits comfortably in unified memory.
+### OpenAI Python SDK
 
-| `model` | Notes |
-|---|---|
-| `black-forest-labs/FLUX.1-schnell` | Fast 4-step model. **Recommended.** Accept gate required. |
-| `black-forest-labs/FLUX.1-dev` | Higher quality, 20–50 steps. Accept gate required. |
-
-### API examples
-
-```bash
-# Pre-load the model (optional; happens automatically on first generation)
-curl -X POST http://localhost:8002/v1/models/load \
-  -H 'Content-Type: application/json' \
-  -d '{"model": "black-forest-labs/FLUX.1-schnell", "quantize": 4}'
-
-# Generate an image (b64_json response)
-curl http://localhost:8002/v1/images/generations \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "prompt": "a red apple on a wooden table, photorealistic",
-    "size": "1024x1024",
-    "steps": 4,
-    "seed": 42
-  }' | python3 -c "
-import sys, json, base64
-r = json.load(sys.stdin)
-open('out.png','wb').write(base64.b64decode(r['data'][0]['b64_json']))
-print('Saved out.png')
-"
-
-# OpenAI Python SDK
+```python
 from openai import OpenAI
+import base64
+
 client = OpenAI(base_url="http://localhost:8002/v1", api_key="local")
 resp = client.images.generate(
-    model="flux-schnell",
+    model="flux2-klein",
     prompt="a watercolor painting of a mountain lake at sunrise",
     size="1024x1024",
-    n=1,
 )
-# resp.data[0].b64_json contains the PNG
+open("out.png", "wb").write(base64.b64decode(resp.data[0].b64_json))
 ```
 
 ### Request parameters
@@ -363,50 +286,42 @@ resp = client.images.generate(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `prompt` | string | required | Text prompt |
-| `model` | string | `flux-schnell` | `flux-schnell` or `flux-dev` |
-| `size` | string | `1024x1024` | `WIDTHxHEIGHT`, e.g. `512x512`, `1024x768` |
-| `n` | int | `1` | Number of images (max 4) |
+| `model` | string | `flux2-klein-4b` | Model alias or HF repo ID |
+| `size` | string | `1024x1024` | `WIDTHxHEIGHT` |
+| `n` | int | `1` | Images to generate (max 4) |
 | `response_format` | string | `b64_json` | `b64_json` or `url` (data URI) |
-| `steps` | int | `4` | Inference steps (4 for schnell, 20–50 for dev) |
-| `guidance` | float | `4.0` | Classifier-free guidance scale |
-| `seed` | int | random | RNG seed for reproducibility |
-| `negative_prompt` | string | — | Negative prompt (dev only) |
-| `quantize` | int | — | Quantize weights on load: `4` or `8` |
+| `steps` | int | `4` | Inference steps |
+| `guidance` | float | `1.0` | Guidance scale |
+| `seed` | int | random | Reproducibility |
+| `quantize` | int | `4` | Quantize on load: `4` or `8` |
 
 ---
 
 ## mlx-audio-server
 
-OpenAI-compatible audio inference powered by [mlx-audio](https://github.com/Blaizzy/mlx-audio).
+OpenAI-compatible audio via [mlx-audio](https://github.com/Blaizzy/mlx-audio).
 
 ### Features
 
 - **TTS** (`POST /v1/audio/speech`) — Kokoro, streaming chunked WAV or full file
-- **STT** (`POST /v1/audio/transcriptions`) — Whisper-family, optional segment timestamps
+- **STT** (`POST /v1/audio/transcriptions`) — Whisper-family, optional timestamps
 - **Translation** (`POST /v1/audio/translations`) — STT with forced English output
-- **Source separation** (`POST /v1/audio/separations`) — SAM-Audio, text-guided target extraction
-- **Model management** (`GET/POST/DELETE /v1/models`) — hot-load/unload any model at runtime
+- **Source separation** (`POST /v1/audio/separations`) — SAM-Audio, text-guided
 
 ### API examples
 
 ```bash
-# TTS — returns WAV
+# TTS
 curl http://localhost:8001/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"model":"kokoro","input":"Hello from Apple Silicon!","voice":"af_heart"}' \
   --output speech.wav
 
-# TTS streaming
-curl http://localhost:8001/v1/audio/speech \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"kokoro","input":"Streaming...","stream":true}' \
-  --output stream.wav
-
 # STT
 curl http://localhost:8001/v1/audio/transcriptions \
   -F file=@audio.wav -F model=whisper-large-v3
 
-# Source separation — extract speech from a mixed recording
+# Source separation
 curl http://localhost:8001/v1/audio/separations \
   -F file=@mixed.wav -F description="speech"
 ```
@@ -418,13 +333,11 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8001/v1", api_key="local")
 
-# TTS
 with client.audio.speech.with_streaming_response.create(
     model="kokoro", voice="af_heart", input="Hello!"
 ) as r:
     r.stream_to_file("out.wav")
 
-# STT
 with open("audio.wav", "rb") as f:
     print(client.audio.transcriptions.create(model="whisper", file=f).text)
 ```
@@ -433,116 +346,63 @@ with open("audio.wav", "rb") as f:
 
 ## Multi-Mac distributed inference
 
-As of [mlx-lm v0.30.6](https://github.com/ml-explore/mlx-lm), mlx-lm's built-in server supports multi-rank distributed inference via `mx.distributed`. This is separate from the Rust servers but can be used alongside them — the Rust server talks to rank-0.
-
-### Backends
+mlx-lm v0.30.6+ supports multi-rank distributed inference via `mx.distributed`. The Rust server talks to rank-0.
 
 | Backend | Transport | Requirements |
 |---|---|---|
-| **JACCL** | Thunderbolt RDMA | macOS 26.2+, `rdma_ctl enable` in recovery, Thunderbolt 5 mesh |
-| **Ring** | TCP/Ethernet | any macOS, ring topology |
-| **MPI** | any | MPI install |
-
-### Setup (Thunderbolt, 2 Macs)
+| JACCL | Thunderbolt RDMA | macOS 26.2+, Thunderbolt 5 mesh |
+| Ring | TCP/Ethernet | any macOS |
+| MPI | any | MPI install |
 
 ```bash
 # Generate hostfile
-mlx.distributed_config \
-  --hosts mac1.local,mac2.local \
-  --over thunderbolt \
-  --backend jaccl \
-  --auto-setup \
-  --output hostfile.json
+mlx.distributed_config --hosts mac1.local,mac2.local --over thunderbolt --backend jaccl --output hostfile.json
 
-# Launch distributed inference
-MLX_METAL_FAST_SYNCH=1 mlx.launch \
-  --backend jaccl \
-  --hostfile hostfile.json \
-  -- python -m mlx_lm chat \
-       --model mlx-community/Llama-3.1-70B-Instruct-4bit
+# Launch 70B across two Macs
+MLX_METAL_FAST_SYNCH=1 mlx.launch --backend jaccl --hostfile hostfile.json \
+  -- python -m mlx_lm chat --model mlx-community/Llama-3.1-70B-Instruct-4bit
 ```
 
-For Ethernet (ring topology):
-
-```bash
-mlx.distributed_config --hosts mac1,mac2,mac3 --over ethernet --backend ring --output hostfile.json
-mlx.launch --backend ring --hostfile hostfile.json -- python -m mlx_lm.server --model ...
-```
-
-> Reference: [WWDC 2025 — Explore distributed inference and training with MLX](https://developer.apple.com/videos/play/wwdc2025/)  
-> Docs: [MLX distributed](https://ml-explore.github.io/mlx/build/html/usage/distributed.html)
+> Reference: [WWDC 2025 — Explore distributed inference and training with MLX](https://developer.apple.com/videos/play/wwdc2025/)
 
 ---
 
-## Examples
-
-```
-examples/
-  sts_demo.py      Live mic → source-separation demo (needs mlx-audio-server on :8001)
-  bench_lm.py      Throughput / TTFT / concurrency benchmark for mlx-lm-server
-```
+## Building from source
 
 ```bash
-# Run the STS demo
-pip install sounddevice soundfile scipy numpy requests
-python examples/sts_demo.py --server http://localhost:8001
+# Check workspace
+PYO3_PYTHON=.venv/bin/python cargo check --workspace
 
-# Mix background music for best results
-python examples/sts_demo.py --mix background.wav --duration 8
-
-# Benchmark the LM server
-python examples/bench_lm.py
-```
-
----
-
-## Building both
-
-```bash
-# Check both crates
-PYO3_PYTHON=/path/to/.venv/bin/python cargo check --workspace
-
-# Build both release binaries
-PYO3_PYTHON=/path/to/.venv/bin/python cargo build --release --workspace
+# Release binaries
+PYO3_PYTHON=.venv/bin/python cargo build --release --workspace
 # → target/release/mlx-lm-server
 # → target/release/mlx-audio-server
+# → target/release/mlx-image-server
 ```
 
 ## Repo layout
 
 ```
 mlx-local-server/
-├── run.sh                  Unified entry: ./run.sh lm|audio [flags...]
-├── Cargo.toml              Workspace manifest + shared deps
+├── run.sh                  Entry point: ./run.sh lm|audio|image
+├── Cargo.toml              Workspace manifest
 ├── mlx-lm-server/          LLM inference server
-│   ├── src/
-│   ├── Cargo.toml
-│   └── run.sh              Thin wrapper → root run.sh lm
 ├── mlx-audio-server/       Audio inference server
-│   ├── src/
-│   ├── Cargo.toml
-│   └── run.sh              Thin wrapper → root run.sh audio
+├── mlx-image-server/       Image generation server
+├── tools/
+│   └── convert_mflux_model.py   Convert old mflux community models to 0.18+ format
 └── examples/
-    ├── sts_demo.py
-    └── bench_lm.py
+    ├── sts_demo.py          Live mic → source-separation demo
+    └── bench_lm.py          Throughput / TTFT benchmark
 ```
 
-## Requirements
-
-- Apple Silicon Mac (M1/M2/M3/M4/M5)
-- Rust 1.75+
-- Python 3.12 or 3.13
-- M5 with macOS 26.2+: automatic Neural Accelerator (NAX) support via MLX Metal backend — no code changes needed
-
-## Related resources
+## Related
 
 - [MLX](https://github.com/ml-explore/mlx) — Apple's ML framework for Apple Silicon
-- [mlx-lm](https://github.com/ml-explore/mlx-lm) — LLM inference Python library
-- [mlx-audio](https://github.com/Blaizzy/mlx-audio) — Audio inference Python library
-- [MLX Swift](https://github.com/ml-explore/mlx-swift) — Swift bindings for MLX
-- [WWDC 2025: Build local AI agents on Mac with MLX](https://developer.apple.com/videos/play/wwdc2025/)
-- [WWDC 2025: Get started with MLX for Apple silicon](https://developer.apple.com/videos/play/wwdc2025/)
-- [WWDC 2025: Explore large language models on Apple silicon with MLX](https://developer.apple.com/videos/play/wwdc2025/)
+- [mlx-lm](https://github.com/ml-explore/mlx-lm) — LLM inference
+- [mflux](https://github.com/filipstrand/mflux) — FLUX image generation on MLX
+- [mlx-audio](https://github.com/Blaizzy/mlx-audio) — Audio inference
+- [FLUX.2-klein-4B-mflux-4bit](https://huggingface.co/ar9av/FLUX.2-klein-4B-mflux-4bit) — Pre-quantized image model
 
 ## License
 
