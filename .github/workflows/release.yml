@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Apple Silicon binaries
+    runs-on: macos-14  # M1 runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Set up Python 3.13
+        run: |
+          brew install python@3.13
+          python3.13 -m venv .venv
+          .venv/bin/pip install -q --upgrade pip
+          .venv/bin/pip install -q mlx mlx-lm mflux mlx-audio numpy
+
+      - name: Build release binaries
+        run: |
+          PYO3_PYTHON="$(pwd)/.venv/bin/python" \
+            cargo build --release --workspace
+
+      - name: Inspect dylib links
+        run: |
+          for bin in mlx-lm-server mlx-audio-server mlx-image-server; do
+            echo "=== $bin ==="
+            otool -L target/release/$bin | grep -i python || true
+          done
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE="mlx-local-server-${TAG}-apple-silicon.tar.gz"
+
+          mkdir -p dist
+          cp target/release/mlx-lm-server dist/
+          cp target/release/mlx-audio-server dist/
+          cp target/release/mlx-image-server dist/
+          cp run.sh dist/
+          chmod +x dist/run.sh
+
+          cat > dist/INSTALL.md << 'EOF'
+          # Installation
+
+          ## Requirements
+          - Apple Silicon Mac (M1/M2/M3/M4/M5)
+          - Python 3.13: `brew install python@3.13`
+
+          ## Run
+
+          ```bash
+          # LLM server
+          ./run.sh lm
+
+          # Image generation
+          ./run.sh image
+
+          # Audio (TTS/STT)
+          ./run.sh audio
+          ```
+
+          On first run, `run.sh` creates a Python venv, installs Python deps, and starts the server.
+          Rust is NOT required — binaries are pre-built.
+
+          Full docs: https://github.com/Ar9av/mlx-lm-server
+          EOF
+
+          tar -czf "$ARCHIVE" -C dist .
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE }}
+          generate_release_notes: true
+          body: |
+            ## mlx-local-server ${{ github.ref_name }}
+
+            Pre-built binaries for **Apple Silicon** (M1/M2/M3/M4/M5).
+
+            ### Install
+
+            ```bash
+            curl -L https://github.com/Ar9av/mlx-lm-server/releases/download/${{ github.ref_name }}/mlx-local-server-${{ github.ref_name }}-apple-silicon.tar.gz | tar -xz
+            brew install python@3.13   # if not already installed
+            ./run.sh lm                # start LLM server on :8080
+            ./run.sh image             # start image server on :8002
+            ./run.sh audio             # start audio server on :8001
+            ```
+
+            No Rust required. Python deps are installed automatically by `run.sh`.
+
+            ### What's included
+            - `mlx-lm-server` — OpenAI-compatible LLM server (port 8080)
+            - `mlx-audio-server` — TTS/STT/audio server (port 8001)
+            - `mlx-image-server` — FLUX.2 image generation (port 8002)
+            - `run.sh` — launcher (handles Python deps + venv)
