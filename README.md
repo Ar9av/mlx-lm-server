@@ -309,23 +309,27 @@ OpenAI-compatible image generation powered by [mflux](https://github.com/filipst
 
 ### Models
 
-The official FLUX.1 models (`black-forest-labs/FLUX.1-schnell`) require accepting the license at [huggingface.co/black-forest-labs/FLUX.1-schnell](https://huggingface.co/black-forest-labs/FLUX.1-schnell) and running `huggingface-cli login`.
+This server uses **mflux 0.18+** which requires the official weights from Black Forest Labs. Community models saved with older mflux versions (e.g. `madroid/flux.1-schnell-mflux-4bit`) are **not compatible** — they use a different quantization format and will produce garbled output.
 
-Alternatively, use a public pre-quantized community model — no auth required:
+**Setup (one-time):**
+1. Create a HuggingFace account at huggingface.co
+2. Visit [huggingface.co/black-forest-labs/FLUX.1-schnell](https://huggingface.co/black-forest-labs/FLUX.1-schnell) and click "Access repository" to accept the free license
+3. Run `huggingface-cli login` (or set `HUGGINGFACE_TOKEN` env var)
 
-| `model` | `model_path` | Size | Notes |
-|---|---|---|---|
-| `flux-schnell` | `madroid/flux.1-schnell-mflux-4bit` | ~3.4 GB | 4-bit, no auth required |
-| `flux-schnell` | *(none, needs HF auth)* | ~34 GB | bf16, then quantize locally |
-| `flux-dev` | *(none, needs HF auth)* | ~34 GB | higher quality, 20–50 steps |
+On first use, mflux downloads (~34 GB) and caches the model. With `quantize=4`, the on-disk cache shrinks to ~9 GB and fits comfortably in unified memory.
+
+| `model` | Notes |
+|---|---|
+| `black-forest-labs/FLUX.1-schnell` | Fast 4-step model. **Recommended.** Accept gate required. |
+| `black-forest-labs/FLUX.1-dev` | Higher quality, 20–50 steps. Accept gate required. |
 
 ### API examples
 
 ```bash
-# Load a public pre-quantized model (no HF auth needed)
+# Pre-load the model (optional; happens automatically on first generation)
 curl -X POST http://localhost:8002/v1/models/load \
   -H 'Content-Type: application/json' \
-  -d '{"model": "flux-schnell", "model_path": "madroid/flux.1-schnell-mflux-4bit"}'
+  -d '{"model": "black-forest-labs/FLUX.1-schnell", "quantize": 4}'
 
 # Generate an image (b64_json response)
 curl http://localhost:8002/v1/images/generations \

@@ -24,7 +24,8 @@ pub async fn create_image(
     // Auto-load default model if nothing is loaded
     if !state.svc.is_loaded().await {
         let model_name = req.model.clone().unwrap_or_else(|| state.config.default_model.clone());
-        let quantize = req.quantize.or(state.config.default_quantize);
+        // Default to 4-bit quantization to keep the large FLUX models in memory
+        let quantize = req.quantize.or(state.config.default_quantize).or(Some(4));
         if let Err(e) = state.svc.load(model_name, quantize, None).await {
             return e.into_response();
         }
