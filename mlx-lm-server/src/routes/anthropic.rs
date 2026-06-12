@@ -93,7 +93,7 @@ async fn sync_messages(
 ) -> axum::response::Response {
     info!("Anthropic sync message for model {}", model_name);
     match state.mlx.generate_response(messages, max_tokens, sampler, serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name, None, vec![], false, 0, None, None).await {
-        Ok((content, prompt_tokens, completion_tokens, _tool_calls, _finish_reason, _lp)) => {
+        Ok((content, prompt_tokens, completion_tokens, _tool_calls, _finish_reason, _lp, _reasoning)) => {
             let resp = AnthropicResponse::new(
                 MlxService::new_msg_id(),
                 model_name,

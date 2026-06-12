@@ -7,4 +7,5 @@ pub mod embeddings;
 pub mod finetune;
 pub mod health;
 pub mod models;
+pub mod rerank;
 pub mod train;

@@ -15,6 +15,17 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub stream_timeout: f64,
     pub max_concurrent: usize,
+    /// Override top_k for MoE router layers at model load time (e.g. 4 for Qwen3-MoE).
+    /// Reduces router fan-out and gives ~7-16% decode speedup with minimal quality impact.
+    pub moe_top_k: Option<u32>,
+    /// Multiply the reported context_length in /v1/models by this factor.
+    /// Use when running small-ctx models with clients that expect large context windows.
+    pub context_scale: f64,
+    /// Path to a JSON file containing warm-up message arrays (array of message arrays).
+    /// These are prefilled at startup to prime the KV cache prefix.
+    pub warm_prompts_file: Option<String>,
+    /// Interval in seconds for SSE keep-alive comments during long prefill.
+    pub keepalive_secs: u64,
 }
 
 impl Config {
@@ -39,6 +50,10 @@ impl Config {
             ),
             stream_timeout: env_f64("MLX_STREAM_TIMEOUT", 120.0),
             max_concurrent: env_usize("MLX_MAX_CONCURRENT", 1),
+            moe_top_k: env_opt_u32("MLX_MOE_TOP_K"),
+            context_scale: env_f64("MLX_CONTEXT_SCALE", 1.0),
+            warm_prompts_file: env_opt_str("MLX_WARM_PROMPTS"),
+            keepalive_secs: env_usize("MLX_KEEPALIVE_SECS", 15) as u64,
         }
     }
 }
@@ -77,6 +92,14 @@ fn env_u16(key: &str, default: u16) -> u16 {
 
 fn env_opt_f64(key: &str) -> Option<f64> {
     env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+fn env_opt_u32(key: &str) -> Option<u32> {
+    env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+fn env_opt_str(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 fn env_opt_list(key: &str) -> Option<Vec<String>> {

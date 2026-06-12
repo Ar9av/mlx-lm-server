@@ -82,6 +82,13 @@ pub struct SamplerParams {
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
     pub num_draft_tokens: Option<usize>,
+    /// XTC (Exclude Top Choices) sampler — improves diversity by removing highly
+    /// probable tokens with probability `xtc_probability` when they exceed `xtc_threshold`.
+    pub xtc_probability: Option<f64>,
+    pub xtc_threshold: Option<f64>,
+    /// Max thinking tokens for reasoning models (Qwen3/DeepSeek-R1).
+    /// Forces </think> after this many tokens in the reasoning block.
+    pub thinking_budget: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +178,10 @@ pub struct ChatCompletionRequest {
     pub kv_bits: Option<u32>,
     pub kv_group_size: Option<u32>,
     pub adapter_name: Option<String>,
+    pub xtc_probability: Option<f64>,
+    pub xtc_threshold: Option<f64>,
+    /// Max thinking tokens for reasoning models. Forces </think> after N tokens.
+    pub thinking_budget: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -218,6 +229,7 @@ impl ChatCompletionResponse {
                 finish_reason: Some("stop".into()),
                 tool_calls: None,
                 logprobs: None,
+                reasoning_content: None,
             }],
             usage,
         }
@@ -235,6 +247,7 @@ impl ChatCompletionResponse {
                 finish_reason: Some("tool_calls".into()),
                 tool_calls: Some(tool_calls),
                 logprobs: None,
+                reasoning_content: None,
             }],
             usage,
         }
@@ -250,6 +263,8 @@ pub struct ChatCompletionChoice {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogprobsInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -267,6 +282,22 @@ impl ChatCompletionChunk {
     }
 
     pub fn token_lp(id: &str, model: &str, content: &str, first: bool, logprobs: Option<LogprobsInfo>) -> Self {
+        Self::token_lp_reasoning(id, model, content, first, logprobs, false)
+    }
+
+    pub fn token_lp_reasoning(
+        id: &str,
+        model: &str,
+        content: &str,
+        first: bool,
+        logprobs: Option<LogprobsInfo>,
+        is_reasoning: bool,
+    ) -> Self {
+        let (content_field, reasoning_field) = if is_reasoning {
+            (None, Some(content.to_string()))
+        } else {
+            (Some(content.to_string()), None)
+        };
         Self {
             id: id.to_string(),
             object: "chat.completion.chunk",
@@ -274,7 +305,12 @@ impl ChatCompletionChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: if first { Some("assistant".into()) } else { None }, content: Some(content.to_string()), tool_calls: None },
+                delta: Delta {
+                    role: if first { Some("assistant".into()) } else { None },
+                    content: content_field,
+                    reasoning_content: reasoning_field,
+                    tool_calls: None,
+                },
                 finish_reason: None,
                 logprobs,
             }],
@@ -293,7 +329,7 @@ impl ChatCompletionChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: None, content: None, tool_calls: None },
+                delta: Delta { role: None, content: None, reasoning_content: None, tool_calls: None },
                 finish_reason: Some(reason.to_string()),
                 logprobs: None,
             }],
@@ -308,7 +344,7 @@ impl ChatCompletionChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: Some("assistant".into()), content: None, tool_calls: Some(tool_calls) },
+                delta: Delta { role: Some("assistant".into()), content: None, reasoning_content: None, tool_calls: Some(tool_calls) },
                 finish_reason: Some("tool_calls".to_string()),
                 logprobs: None,
             }],
@@ -331,6 +367,8 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
@@ -802,4 +840,34 @@ pub struct HfModel {
     pub likes: u64,
     pub size_bytes: Option<u64>,
     pub cached: bool,
+}
+
+// ── Rerank ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct RerankRequest {
+    pub model: Option<String>,
+    pub query: String,
+    pub documents: Vec<String>,
+    /// Return only the top_n results (default: return all, sorted by score)
+    pub top_n: Option<usize>,
+    /// Include document text in the response (default: false)
+    #[serde(default)]
+    pub return_documents: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RerankResult {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    pub relevance_score: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RerankResponse {
+    pub object: &'static str,
+    pub results: Vec<RerankResult>,
+    pub model: String,
+    pub usage: Usage,
 }

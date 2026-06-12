@@ -6,6 +6,8 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
+use tokio::time::Duration;
+use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{error, info};
 
 use crate::error::MlxError;
@@ -99,6 +101,9 @@ pub async fn chat_completions(
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
         num_draft_tokens: req.num_draft_tokens,
+        xtc_probability: req.xtc_probability,
+        xtc_threshold: req.xtc_threshold,
+        thinking_budget: req.thinking_budget,
     };
     let chat_template_kwargs = req.chat_template_kwargs.clone();
     let kv_bits = req.kv_bits;
@@ -150,13 +155,17 @@ async fn sync_response(
     info!("Generating sync response for model {}", model_name);
 
     match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id).await {
-        Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list)) => {
+        Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list, reasoning)) => {
             let usage = Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
             let mut resp = if !tool_calls.is_empty() {
                 ChatCompletionResponse::with_tool_calls(MlxService::new_chat_id(), model_name, tool_calls, usage)
             } else {
                 ChatCompletionResponse::new(MlxService::new_chat_id(), model_name, content, usage)
             };
+            // Attach reasoning content if present
+            if let (Some(r), Some(choice)) = (reasoning, resp.choices.first_mut()) {
+                choice.reasoning_content = Some(r);
+            }
             if let Some(choice) = resp.choices.first_mut() {
                 choice.finish_reason = Some(finish_reason);
                 if let Some(lps) = lp_list {
@@ -224,12 +233,24 @@ async fn stream_response(
     let finish_reason_w = finish_reason.clone();
     // Pending logprob for the next text token
     let mut pending_lp: Option<LogprobsInfo> = None;
+    // Reasoning state machine: track whether we're inside <think>...</think>
+    let mut in_think = false;
+    let mut think_buf = String::new(); // partial tag accumulation for split-chunk detection
 
-    let sse_stream = token_stream.map(move |result| -> Result<Bytes, std::io::Error> {
+    // Wrap the token stream with keep-alive timeouts so the client doesn't disconnect
+    // during long prefill phases. SSE comment lines are ignored by all clients.
+    let keepalive_dur = Duration::from_secs(state.config.keepalive_secs);
+    let token_stream_timed = TokioStreamExt::timeout(token_stream, keepalive_dur);
+
+    let sse_stream = futures::StreamExt::map(token_stream_timed, move |timed| -> Result<Bytes, std::io::Error> {
+        // Timeout = no token for keepalive_dur; emit SSE comment
+        let result = match timed {
+            Err(_elapsed) => return Ok(Bytes::from(": keep-alive\n\n")),
+            Ok(r) => r,
+        };
         let data = match result {
             Ok(token) => {
                 if token.starts_with(FINISH_SENTINEL) {
-                    // Store finish_reason; emit nothing (final stop chunk handles it)
                     let reason = token
                         .trim_start_matches(FINISH_SENTINEL)
                         .trim_end_matches('\x00')
@@ -240,7 +261,6 @@ async fn stream_response(
                     return Ok(Bytes::new());
                 }
                 if token.starts_with(LP_SENTINEL) {
-                    // Parse and buffer logprob for the next token
                     let json_part = token.trim_start_matches(LP_SENTINEL).trim_end_matches('\x00');
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_part) {
                         let tok = v["token"].as_str().unwrap_or("").to_string();
@@ -262,9 +282,26 @@ async fn stream_response(
                     let chunk = ChatCompletionChunk::tool_calls_chunk(&chat_id_clone, &model_clone, tool_calls);
                     serde_json::to_string(&chunk).unwrap_or_default()
                 } else {
+                    // Reasoning state machine: route <think> content to reasoning_content delta
+                    let (content_text, reasoning_text, new_in_think) =
+                        classify_token(&token, &mut think_buf, in_think);
+                    in_think = new_in_think;
+
                     let lp = pending_lp.take();
-                    let chunk = ChatCompletionChunk::token_lp(&chat_id_clone, &model_clone, &token, first, lp);
-                    first = false;
+                    let is_first = first;
+                    if is_first && (content_text.is_some() || reasoning_text.is_some()) {
+                        first = false;
+                    }
+                    let chunk = if let Some(rt) = reasoning_text {
+                        ChatCompletionChunk::token_lp_reasoning(
+                            &chat_id_clone, &model_clone, &rt, is_first, lp, true,
+                        )
+                    } else {
+                        let ct = content_text.unwrap_or_default();
+                        ChatCompletionChunk::token_lp(
+                            &chat_id_clone, &model_clone, &ct, is_first, lp,
+                        )
+                    };
                     serde_json::to_string(&chunk).unwrap_or_default()
                 }
             }
@@ -276,7 +313,7 @@ async fn stream_response(
     });
 
     let mlx_svc = state.mlx.clone();
-    let combined = sse_stream.chain(futures::stream::once(async move {
+    let combined = futures::StreamExt::chain(sse_stream, futures::stream::once(async move {
         let reason = finish_reason.lock().map(|g| g.clone()).unwrap_or_else(|_| "stop".into());
         let final_chunk = ChatCompletionChunk::finish(&chat_id, &model_name, &reason);
         let final_data = format!(
@@ -319,4 +356,84 @@ pub async fn delete_session(
 ) -> impl IntoResponse {
     state.mlx.delete_prompt_session(&session_id).await;
     (StatusCode::OK, Json(serde_json::json!({"deleted": session_id}))).into_response()
+}
+
+/// Route a streaming token to either content or reasoning_content based on <think> tag state.
+/// Returns (content, reasoning, new_in_think). The tag accumulation buffer handles tokens
+/// that arrive in the middle of a `<think>` or `</think>` tag split across chunks.
+fn classify_token(
+    token: &str,
+    buf: &mut String,
+    in_think: bool,
+) -> (Option<String>, Option<String>, bool) {
+    buf.push_str(token);
+
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let mut content_out = String::new();
+    let mut reasoning_out = String::new();
+    let mut state = in_think;
+    let mut remaining = buf.as_str();
+
+    loop {
+        if state {
+            // Inside reasoning — look for </think>
+            if let Some(pos) = remaining.find(CLOSE) {
+                reasoning_out.push_str(&remaining[..pos]);
+                remaining = &remaining[pos + CLOSE.len()..];
+                state = false;
+            } else if remaining.ends_with_partial_prefix(CLOSE) {
+                // Partial </think> at end — keep in buffer, don't emit yet
+                let safe_end = remaining.len().saturating_sub(CLOSE.len() - 1);
+                reasoning_out.push_str(&remaining[..safe_end]);
+                remaining = &remaining[safe_end..];
+                break;
+            } else {
+                reasoning_out.push_str(remaining);
+                remaining = "";
+                break;
+            }
+        } else {
+            // Outside reasoning — look for <think>
+            if let Some(pos) = remaining.find(OPEN) {
+                content_out.push_str(&remaining[..pos]);
+                remaining = &remaining[pos + OPEN.len()..];
+                state = true;
+            } else if remaining.ends_with_partial_prefix(OPEN) {
+                let safe_end = remaining.len().saturating_sub(OPEN.len() - 1);
+                content_out.push_str(&remaining[..safe_end]);
+                remaining = &remaining[safe_end..];
+                break;
+            } else {
+                content_out.push_str(remaining);
+                remaining = "";
+                break;
+            }
+        }
+    }
+
+    *buf = remaining.to_string();
+
+    let content = if content_out.is_empty() { None } else { Some(content_out) };
+    let reasoning = if reasoning_out.is_empty() { None } else { Some(reasoning_out) };
+    (content, reasoning, state)
+}
+
+trait EndsWithPartialPrefix {
+    fn ends_with_partial_prefix(&self, prefix: &str) -> bool;
+}
+
+impl EndsWithPartialPrefix for str {
+    fn ends_with_partial_prefix(&self, prefix: &str) -> bool {
+        // Check if self ends with any non-empty prefix of `prefix`
+        let bytes = self.as_bytes();
+        let prefix_bytes = prefix.as_bytes();
+        for len in (1..prefix_bytes.len()).rev() {
+            if bytes.ends_with(&prefix_bytes[..len]) {
+                return true;
+            }
+        }
+        false
+    }
 }

@@ -93,10 +93,48 @@ async fn main() {
         .route("/v1/sessions/:session_id", delete(routes::chat::delete_session))
         // Benchmarking
         .route("/v1/benchmark", post(routes::benchmark::run_benchmark))
+        // Reranking
+        .route("/v1/rerank", post(routes::rerank::rerank))
         // Middleware
         .layer(middleware::from_fn(request_id_middleware))
         .layer(cors)
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Warm prompts: load default model and pre-fill KV cache for known prompts
+    if let Some(ref warm_file) = cfg.warm_prompts_file.clone() {
+        let warm_state = state.clone();
+        let warm_file = warm_file.clone();
+        let default_model = cfg.default_model.clone();
+        tokio::spawn(async move {
+            if let Err(e) = warm_state.mlx.load_model(default_model, None).await {
+                tracing::warn!("Warm-up: failed to load model: {}", e);
+                return;
+            }
+            match tokio::fs::read_to_string(&warm_file).await {
+                Ok(content) => match serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&content) {
+                    Ok(sets) => {
+                        use crate::models::{ChatMessage, MessageContent};
+                        let message_sets: Vec<Vec<ChatMessage>> = sets
+                            .into_iter()
+                            .map(|msgs| {
+                                msgs.into_iter()
+                                    .filter_map(|m| {
+                                        let role = m["role"].as_str()?.to_string();
+                                        let content = m["content"].as_str().unwrap_or("").to_string();
+                                        Some(ChatMessage { role, content: MessageContent::Text(content) })
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        info!("Running warm-up for {} prompt set(s)", message_sets.len());
+                        warm_state.mlx.warm_up(message_sets).await;
+                    }
+                    Err(e) => tracing::warn!("Warm-up: failed to parse {}: {}", warm_file, e),
+                },
+                Err(e) => tracing::warn!("Warm-up: cannot read {}: {}", warm_file, e),
+            }
+        });
+    }
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse().expect("invalid address");
     info!("MLX LM Server listening on http://{}", addr);

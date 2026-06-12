@@ -126,6 +126,7 @@ impl MlxService {
 
         info!("Loading model: {} (adapter: {:?}, drafter: {:?})", model_id, adapter, drafter);
         let mid = model_id.clone();
+        let moe_top_k = self.config.moe_top_k;
         let (model_py, tokenizer_py, draft_model_py) = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<(PyObject, PyObject, Option<PyObject>)> {
                 let mlx_lm = py.import("mlx_lm")?;
@@ -136,6 +137,12 @@ impl MlxService {
                 let result = mlx_lm.getattr("load")?.call((&mid,), Some(kwargs))?;
                 let model: PyObject = result.get_item(0)?.into();
                 let tokenizer: PyObject = result.get_item(1)?.into();
+
+                // Apply MoE top-k override: reduces router fan-out for ~7-16% decode speedup
+                if let Some(top_k) = moe_top_k {
+                    let model_ref = model.as_ref(py);
+                    apply_moe_top_k(py, model_ref, top_k)?;
+                }
 
                 let draft = if let Some(ref drafter_id) = drafter {
                     info!("Loading draft model: {}", drafter_id);
@@ -359,7 +366,7 @@ impl MlxService {
         top_n_logprobs: u32,
         seed: Option<u64>,
         session_id: Option<String>,
-    ) -> Result<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>), MlxError> {
+    ) -> Result<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>, Option<String>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
 
         // Get or create session KV cache
@@ -376,7 +383,7 @@ impl MlxService {
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> PyResult<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>)> {
+            Python::with_gil(|py| -> PyResult<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>, Option<String>)> {
                 // Ensure Metal stream is initialized on this thread before any GPU ops
                 let _ = py.import("mlx.core").and_then(|mx| mx.call_method0("synchronize"));
                 let tokenizer = tokenizer_py.as_ref(py);
@@ -409,6 +416,14 @@ impl MlxService {
                 }
                 if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                 if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
+
+                // Thinking budget logits processor
+                if let Some(budget) = sampler.thinking_budget {
+                    if let Ok(proc) = make_thinking_budget_processor(py, tokenizer, budget) {
+                        let processors = PyList::new(py, &[proc]);
+                        kwargs.set_item("logits_processors", processors)?;
+                    }
+                }
 
                 // Set up prompt and optional KV cache
                 if let Some((ref kv_cache, cached_offset)) = session_cache_for_spawn {
@@ -500,7 +515,8 @@ impl MlxService {
                 if !parsed_tool_calls.is_empty() {
                     finish_reason = "tool_calls".to_string();
                 }
-                Ok((response, prompt_tokens, completion_tokens, parsed_tool_calls, finish_reason, lp_list))
+                let (response, reasoning) = extract_reasoning(response);
+                Ok((response, prompt_tokens, completion_tokens, parsed_tool_calls, finish_reason, lp_list, reasoning))
             })
         })
         .await
@@ -583,6 +599,14 @@ impl MlxService {
                     }
                     if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                     if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
+
+                    // Thinking budget logits processor
+                    if let Some(budget) = sampler.thinking_budget {
+                        if let Ok(proc) = make_thinking_budget_processor(py, tokenizer, budget) {
+                            let processors = PyList::new(py, &[proc]);
+                            kwargs.set_item("logits_processors", processors)?;
+                        }
+                    }
 
                     // Set up prompt with optional session KV cache
                     if let Some((ref kv_cache, cached_offset)) = session_cache_for_spawn {
@@ -919,6 +943,38 @@ impl MlxService {
     pub fn new_msg_id() -> String {
         format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24])
     }
+
+    /// Fire max_tokens=1 completions for each warm-up message set to prime the prefix KV cache.
+    pub async fn warm_up(&self, message_sets: Vec<Vec<crate::models::ChatMessage>>) {
+        for messages in message_sets {
+            let sampler = crate::models::SamplerParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                ..Default::default()
+            };
+            let _ = self.generate_response(
+                messages,
+                1,
+                sampler,
+                serde_json::Value::Object(Default::default()),
+                None, None, None, None, vec![], false, 0, None, None,
+            ).await;
+        }
+        info!("Warm-up complete");
+    }
+
+    /// Score query against documents using bi-encoder cosine similarity.
+    /// Returns scores in the same order as input documents.
+    pub async fn rerank(&self, query: String, documents: Vec<String>) -> Result<Vec<f32>, MlxError> {
+        let all_texts: Vec<String> = std::iter::once(query)
+            .chain(documents.into_iter())
+            .collect();
+        let embeddings = self.get_embeddings(all_texts).await?;
+        let mut iter = embeddings.into_iter();
+        let query_emb = iter.next().unwrap_or_default();
+        let scores = iter.map(|doc_emb| cosine_similarity(&query_emb, &doc_emb)).collect();
+        Ok(scores)
+    }
 }
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -1167,9 +1223,143 @@ fn make_sampler<'py>(py: Python<'py>, p: &SamplerParams) -> PyResult<&'py PyAny>
     if let Some(v) = p.top_k     { kwargs.set_item("top_k", v)?; }
     if let Some(v) = p.min_p     { kwargs.set_item("min_p", v)?; }
     if let Some(v) = p.repetition_penalty { kwargs.set_item("repetition_penalty", v)?; }
+    if let Some(v) = p.xtc_probability { kwargs.set_item("xtc_probability", v)?; }
+    if let Some(v) = p.xtc_threshold   { kwargs.set_item("xtc_threshold", v)?; }
     py.import("mlx_lm.sample_utils")?
         .getattr("make_sampler")?
         .call((), Some(kwargs))
+}
+
+/// Walk model layers and reduce top_k on MoE router layers.
+fn apply_moe_top_k(py: Python, model: &PyAny, top_k: u32) -> PyResult<()> {
+    let top_k_i = top_k as i64;
+    let count = apply_moe_top_k_recursive(py, model, top_k_i)?;
+    if count > 0 {
+        info!("MoE top_k override: set top_k={} on {} layer(s)", top_k, count);
+    }
+    Ok(())
+}
+
+fn apply_moe_top_k_recursive(py: Python, module: &PyAny, top_k: i64) -> PyResult<usize> {
+    let mut count = 0usize;
+    let cls_name = module.get_type().name()
+        .ok()
+        .and_then(|s| s.extract::<String>().ok())
+        .unwrap_or_default()
+        .to_lowercase();
+    let is_moe = ["moe", "switch", "sparse", "expert"]
+        .iter()
+        .any(|kw| cls_name.contains(kw));
+    if is_moe {
+        if let Ok(current) = module.getattr("top_k") {
+            if !current.is_none() {
+                module.setattr("top_k", top_k)?;
+                count += 1;
+            }
+        }
+    }
+    // Recurse into children via .children() iterator if available
+    if let Ok(children_fn) = module.getattr("children") {
+        if let Ok(children) = children_fn.call0() {
+            if let Ok(iter) = children.iter() {
+                for child in iter.flatten() {
+                    count += apply_moe_top_k_recursive(py, child, top_k).unwrap_or(0);
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Build a Python logits processor that forces </think> after `budget` reasoning tokens.
+fn make_thinking_budget_processor<'py>(
+    py: Python<'py>,
+    tokenizer: &PyAny,
+    budget: usize,
+) -> PyResult<&'py PyAny> {
+    let code = r#"
+class _ThinkingBudgetProcessor:
+    def __init__(self, tokenizer, budget):
+        self.budget = budget
+        self.think_count = 0
+        self.in_think = False
+        try:
+            ids = tokenizer.encode("<think>", add_special_tokens=False)
+            self.think_start_id = int(ids[-1]) if ids else None
+        except Exception:
+            self.think_start_id = None
+        try:
+            ids_end = tokenizer.encode("</think>", add_special_tokens=False)
+            self.think_end_id = int(ids_end[-1]) if ids_end else None
+        except Exception:
+            self.think_end_id = None
+
+    def __call__(self, tokens, logits):
+        import numpy as _np
+        import mlx.core as _mx
+        if tokens.size > 0:
+            last = int(tokens[-1])
+            if self.think_start_id is not None and last == self.think_start_id:
+                self.in_think = True
+                self.think_count = 0
+            elif self.think_end_id is not None and last == self.think_end_id:
+                self.in_think = False
+        if self.in_think:
+            self.think_count += 1
+            if self.think_count >= self.budget and self.think_end_id is not None:
+                vocab_size = int(logits.shape[-1])
+                forced = _np.full((vocab_size,), -1e9, dtype=_np.float32)
+                forced[self.think_end_id] = 0.0
+                return _mx.array(forced)
+        return logits
+
+_thinking_budget_proc = _ThinkingBudgetProcessor(_tokenizer, _budget)
+"#;
+    let locals = PyDict::new(py);
+    locals.set_item("_tokenizer", tokenizer)?;
+    locals.set_item("_budget", budget as i64)?;
+    py.run(code, None, Some(locals))?;
+    Ok(locals.get_item("_thinking_budget_proc")
+        .and_then(|o| o.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("processor not found")))?)
+}
+
+/// Split a model response into (content, reasoning) by extracting <think>...</think> blocks.
+fn extract_reasoning(response: String) -> (String, Option<String>) {
+    let mut reasoning = String::new();
+    let mut content = response.as_str();
+
+    // Collect all <think>...</think> spans
+    let mut remaining = content;
+    let mut cleaned = String::new();
+    while let Some(start) = remaining.find("<think>") {
+        cleaned.push_str(&remaining[..start]);
+        let after = &remaining[start + "<think>".len()..];
+        if let Some(end) = after.find("</think>") {
+            reasoning.push_str(&after[..end]);
+            remaining = &after[end + "</think>".len()..];
+        } else {
+            // Unclosed <think> — treat rest as reasoning
+            reasoning.push_str(after);
+            remaining = "";
+            break;
+        }
+    }
+    cleaned.push_str(remaining);
+    let cleaned = cleaned.trim().to_string();
+
+    if reasoning.is_empty() {
+        (cleaned, None)
+    } else {
+        (cleaned, Some(reasoning.trim().to_string()))
+    }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
 }
 
 fn count_tokens(py: Python, tokenizer: &PyAny, text: &str) -> usize {

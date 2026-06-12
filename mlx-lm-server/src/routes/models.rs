@@ -128,10 +128,11 @@ pub async fn model_info(
                     .or_else(|| cfg.get("model_type"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let ctx = cfg.get("max_position_embeddings")
+                let ctx_raw = cfg.get("max_position_embeddings")
                     .or_else(|| cfg.get("max_seq_len"))
                     .or_else(|| cfg.get("n_positions"))
                     .and_then(|v| v.as_u64());
+                let ctx = ctx_raw.map(|c| (c as f64 * state.config.context_scale).round() as u64);
                 (is_vision, arch, ctx)
             } else {
                 (false, None, None)
