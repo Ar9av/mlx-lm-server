@@ -96,6 +96,7 @@ mlx-lm ships a built-in Python server. This wraps it in a Rust HTTP layer with s
 | OpenAI chat completions + streaming | ✅ | ✅ |
 | Text completions | ✅ | ✅ |
 | Embeddings | ❌ | ✅ |
+| Reranking (`/v1/rerank`) | ❌ | ✅ |
 | Anthropic Messages API | ❌ | ✅ |
 | Vision routing (`mlx_vlm`) | ❌ | ✅ auto-detects `image_url` |
 | TTS / STT / source separation | ❌ | ✅ |
@@ -106,6 +107,8 @@ mlx-lm ships a built-in Python server. This wraps it in a Rust HTTP layer with s
 | Logprobs | ❌ | ✅ |
 | Seed | ❌ | ✅ |
 | Prompt cache (KV reuse) | ❌ | ✅ |
+| Reasoning field separation | ❌ | ✅ `reasoning_content` delta |
+| SSE keep-alive during prefill | ❌ | ✅ |
 
 ### Model lifecycle
 
@@ -114,13 +117,15 @@ mlx-lm ships a built-in Python server. This wraps it in a Rust HTTP layer with s
 | Runtime load/unload without restart | ❌ | ✅ |
 | LoRA adapter hot-swap | single at startup | ✅ multiple, per-request |
 | Speculative decoding | ❌ | ✅ per-request `num_draft_tokens` |
+| MoE top-k override | ❌ | ✅ `MLX_MOE_TOP_K` |
+| Warm-up KV cache at startup | ❌ | ✅ `MLX_WARM_PROMPTS` |
 | RAM guard | ❌ | ✅ |
 
 ### Sampler parameters
 
-`mlx_lm.server` exposes `temperature` and `top_p`. This server exposes all 8:
+`mlx_lm.server` exposes `temperature` and `top_p`. This server exposes all 10:
 
-`temperature` · `top_p` · `top_k` · `min_p` · `repetition_penalty` · `presence_penalty` · `frequency_penalty` · `num_draft_tokens`
+`temperature` · `top_p` · `top_k` · `min_p` · `repetition_penalty` · `presence_penalty` · `frequency_penalty` · `num_draft_tokens` · `xtc_probability` · `xtc_threshold`
 
 ---
 
@@ -132,12 +137,14 @@ mlx-lm ships a built-in Python server. This wraps it in a Rust HTTP layer with s
 - **Anthropic messages** (`POST /v1/messages`)
 - **Text completions** (`POST /v1/completions`)
 - **Embeddings** (`POST /v1/embeddings`)
+- **Reranking** (`POST /v1/rerank`) — cosine similarity scoring for RAG pipelines
 - **Vision** — auto-routes `image_url` messages to `mlx_vlm`
 - **LoRA adapter hot-swap** — multiple adapters, per-request routing
 - **Speculative decoding** — pass `drafter` on load, `num_draft_tokens` per request
 - **KV-cache quantization** — `kv_bits` + `kv_group_size`
 - **Prompt cache** — `session_id` for KV-cache reuse across turns
 - **Tool use / function calling** — auto-detects model's parser (Llama-3, Qwen, Mistral, etc.)
+- **Reasoning models** — `thinking_budget` caps `<think>` tokens; `reasoning_content` field in response
 - **Logprobs** — `logprobs` + `top_logprobs`
 - **Fine-tuning** (`POST /v1/train`) — LoRA/DoRA with SSE progress stream
 - **Adapter fuse** (`POST /v1/adapters/:name/fuse`)
@@ -167,6 +174,8 @@ Tested on Apple M-series, `mlx-community/Llama-3.2-1B-Instruct-4bit`:
 | `repetition_penalty` | float | Repeat penalty |
 | `presence_penalty` | float | Presence penalty |
 | `frequency_penalty` | float | Frequency penalty |
+| `xtc_probability` | float | XTC sampler — drop probability for top tokens |
+| `xtc_threshold` | float | XTC sampler — logit threshold |
 | `num_draft_tokens` | int | Speculative decoding steps |
 | `kv_bits` | int | KV-cache quantization (4 or 8) |
 | `stop` | string \| array | Stop sequences |
@@ -174,6 +183,8 @@ Tested on Apple M-series, `mlx-community/Llama-3.2-1B-Instruct-4bit`:
 | `logprobs` | bool | Per-token log probabilities |
 | `top_logprobs` | int | Top-N alternatives per token |
 | `session_id` | string | Prompt cache key |
+| `thinking_budget` | int | Max reasoning tokens before forcing `</think>` (Qwen3/R1) |
+| `chat_template_kwargs` | object | Extra kwargs forwarded to `apply_chat_template` (e.g. `{"enable_thinking": false}`) |
 
 ### API examples
 
