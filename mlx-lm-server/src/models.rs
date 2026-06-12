@@ -842,6 +842,43 @@ pub struct HfModel {
     pub cached: bool,
 }
 
+// ── Pipeline ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PipelineStep {
+    pub name: Option<String>,
+    pub system: Option<String>,
+    pub user: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PipelineRequest {
+    pub steps: Vec<PipelineStep>,
+    pub input: String,
+    pub model: Option<String>,
+    pub max_tokens_per_step: Option<usize>,
+    pub temperature: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PipelineStepResult {
+    pub name: Option<String>,
+    pub output: String,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PipelineResponse {
+    pub steps: Vec<PipelineStepResult>,
+    pub output: String,
+    pub model: String,
+    pub total_prompt_tokens: usize,
+    pub total_completion_tokens: usize,
+}
+
 // ── Rerank ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -870,4 +907,52 @@ pub struct RerankResponse {
     pub results: Vec<RerankResult>,
     pub model: String,
     pub usage: Usage,
+}
+
+// ── Batch API ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchRequestItem {
+    pub custom_id: String,
+    pub method: String,
+    pub url: String,
+    pub body: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateBatchRequest {
+    pub endpoint: String,
+    pub requests: Vec<BatchRequestItem>,
+    pub completion_window: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BatchRequestCounts {
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BatchJob {
+    pub id: String,
+    pub object: &'static str,
+    pub endpoint: String,
+    pub status: String,
+    pub created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_progress_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<u64>,
+    pub request_counts: BatchRequestCounts,
+    pub requests: Vec<serde_json::Value>,
+    pub results: Vec<serde_json::Value>,
+    pub errors: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }

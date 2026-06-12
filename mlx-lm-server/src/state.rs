@@ -1,13 +1,18 @@
 use crate::config::Config;
 use crate::mlx_service::MlxService;
+use crate::models::BatchJob;
+use crate::routes::vector_store::VectorStoreEntry;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone)]
 pub struct AppState {
     pub mlx: MlxService,
     pub config: Arc<Config>,
     pub inference_sem: Arc<Semaphore>,
+    pub batches: Arc<Mutex<HashMap<String, BatchJob>>>,
+    pub vector_stores: Arc<Mutex<HashMap<String, VectorStoreEntry>>>,
 }
 
 impl AppState {
@@ -18,6 +23,8 @@ impl AppState {
             inference_sem: Arc::new(Semaphore::new(max)),
             mlx: MlxService::new(config.clone()),
             config,
+            batches: Arc::new(Mutex::new(HashMap::new())),
+            vector_stores: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

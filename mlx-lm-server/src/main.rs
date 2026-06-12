@@ -95,6 +95,17 @@ async fn main() {
         .route("/v1/benchmark", post(routes::benchmark::run_benchmark))
         // Reranking
         .route("/v1/rerank", post(routes::rerank::rerank))
+        // Batch API
+        .route("/v1/batches", post(routes::batch::create_batch).get(routes::batch::list_batches))
+        .route("/v1/batches/:id", get(routes::batch::get_batch))
+        .route("/v1/batches/:id/cancel", post(routes::batch::cancel_batch))
+        // Vector stores
+        .route("/v1/vector_stores", post(routes::vector_store::create_vector_store).get(routes::vector_store::list_vector_stores))
+        .route("/v1/vector_stores/:id", get(routes::vector_store::get_vector_store).delete(routes::vector_store::delete_vector_store))
+        .route("/v1/vector_stores/:id/documents", post(routes::vector_store::add_document))
+        .route("/v1/vector_stores/:id/search", post(routes::vector_store::search_documents))
+        // Pipeline
+        .route("/v1/pipeline", post(routes::pipeline::run_pipeline))
         // Middleware
         .layer(middleware::from_fn(request_id_middleware))
         .layer(cors)
