@@ -113,6 +113,7 @@ pub async fn chat_completions(
         xtc_threshold: req.xtc_threshold,
         thinking_budget: req.thinking_budget,
         logit_bias: req.logit_bias.clone(),
+        grammar: req.grammar.clone(),
     };
     let chat_template_kwargs = req.chat_template_kwargs.clone();
     let kv_bits = req.kv_bits;

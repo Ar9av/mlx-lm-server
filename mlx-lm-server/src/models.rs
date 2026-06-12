@@ -94,6 +94,9 @@ pub struct SamplerParams {
     /// Map of token_id -> bias (-100 to 100). Positive biases increase likelihood,
     /// negative decrease it. -100 effectively bans the token.
     pub logit_bias: Option<std::collections::HashMap<String, f64>>,
+    /// EBNF grammar string for grammar-constrained generation via outlines.
+    /// Overrides response_format if both are set.
+    pub grammar: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +191,7 @@ pub struct ChatCompletionRequest {
     /// Max thinking tokens for reasoning models. Forces </think> after N tokens.
     pub thinking_budget: Option<usize>,
     pub logit_bias: Option<std::collections::HashMap<String, f64>>,
+    pub grammar: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
