@@ -11,6 +11,7 @@ use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{error, info};
 
 use crate::error::MlxError;
+use crate::metrics;
 use crate::mlx_service::{MlxService, MAX_MESSAGE_TOKENS};
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, LogprobsInfo, MessageContent, SamplerParams, StopSequence, TokenizeRequest, TokenizeResponse, TokenLogprob, TopLogprob, Tool, ToolCall, Usage};
 use crate::state::AppState;
@@ -156,6 +157,7 @@ async fn sync_response(
 
     match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id).await {
         Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list, reasoning)) => {
+            metrics::add_tokens(prompt_tokens, completion_tokens);
             let usage = Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
             let mut resp = if !tool_calls.is_empty() {
                 ChatCompletionResponse::with_tool_calls(MlxService::new_chat_id(), model_name, tool_calls, usage)

@@ -27,3 +27,4 @@ thiserror = "1"
 bytes = "1"
 tempfile = "3"
 base64 = "0.22"
+prometheus = { version = "0.13", default-features = false }
