@@ -20,6 +20,13 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    let n = req.n.unwrap_or(1).max(1).min(16);
+    if req.stream.unwrap_or(false) && n > 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": {"message": "streaming does not support n > 1", "type": "invalid_request_error"}
+        }))).into_response();
+    }
+
     if !state.mlx.is_loaded().await {
         if let Err(e) = state.mlx.load_model(req.model.clone(), None).await {
             return e.into_response();
@@ -131,7 +138,7 @@ pub async fn chat_completions(
     if req.stream.unwrap_or(false) {
         stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit).await
     } else {
-        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit).await
+        sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit, n).await
     }
 }
 
@@ -152,47 +159,76 @@ async fn sync_response(
     seed: Option<u64>,
     session_id: Option<String>,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    n: u32,
 ) -> Response {
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
-    info!("Generating sync response for model {}", model_name);
+    info!("Generating {} completion(s) for model {}", n, model_name);
 
-    match state.mlx.generate_response(messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id).await {
-        Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list, reasoning)) => {
-            metrics::add_tokens(prompt_tokens, completion_tokens);
-            let usage = Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
-            let mut resp = if !tool_calls.is_empty() {
-                ChatCompletionResponse::with_tool_calls(MlxService::new_chat_id(), model_name, tool_calls, usage)
-            } else {
-                ChatCompletionResponse::new(MlxService::new_chat_id(), model_name, content, usage)
-            };
-            // Attach reasoning content if present
-            if let (Some(r), Some(choice)) = (reasoning, resp.choices.first_mut()) {
-                choice.reasoning_content = Some(r);
-            }
-            if let Some(choice) = resp.choices.first_mut() {
-                choice.finish_reason = Some(finish_reason);
-                if let Some(lps) = lp_list {
-                    choice.logprobs = Some(LogprobsInfo {
-                        content: lps.into_iter().map(|v| TokenLogprob {
-                            token: v["token"].as_str().unwrap_or("").to_string(),
-                            logprob: v["logprob"].as_f64().unwrap_or(0.0) as f32,
+    let chat_id = MlxService::new_chat_id();
+    let mut choices: Vec<crate::models::ChatCompletionChoice> = Vec::with_capacity(n as usize);
+    let mut total_prompt = 0usize;
+    let mut total_completion = 0usize;
+
+    for i in 0..n {
+        let run_seed = seed.map(|s| s.wrapping_add(i as u64));
+        match state.mlx.generate_response(
+            messages.clone(), max_tokens, sampler.clone(), chat_template_kwargs.clone(),
+            kv_bits, kv_group_size, adapter_name.clone(),
+            tools.clone(), stop_strings.clone(),
+            want_logprobs, top_n_logprobs,
+            run_seed,
+            if i == 0 { session_id.clone() } else { None },
+        ).await {
+            Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list, reasoning)) => {
+                metrics::add_tokens(prompt_tokens, completion_tokens);
+                total_prompt += prompt_tokens;
+                total_completion += completion_tokens;
+
+                let message = if !tool_calls.is_empty() {
+                    crate::models::ChatMessage { role: "assistant".into(), content: crate::models::MessageContent::Text(String::new()) }
+                } else {
+                    crate::models::ChatMessage { role: "assistant".into(), content: crate::models::MessageContent::Text(content) }
+                };
+
+                let logprobs = lp_list.map(|lps| LogprobsInfo {
+                    content: lps.into_iter().map(|v| TokenLogprob {
+                        token: v["token"].as_str().unwrap_or("").to_string(),
+                        logprob: v["logprob"].as_f64().unwrap_or(0.0) as f32,
+                        bytes: None,
+                        top_logprobs: v["top_logprobs"].as_array().unwrap_or(&vec![]).iter().map(|t| TopLogprob {
+                            token: t["token"].as_str().unwrap_or("").to_string(),
+                            logprob: t["logprob"].as_f64().unwrap_or(0.0) as f32,
                             bytes: None,
-                            top_logprobs: v["top_logprobs"].as_array().unwrap_or(&vec![]).iter().map(|t| TopLogprob {
-                                token: t["token"].as_str().unwrap_or("").to_string(),
-                                logprob: t["logprob"].as_f64().unwrap_or(0.0) as f32,
-                                bytes: None,
-                            }).collect(),
                         }).collect(),
-                    });
-                }
+                    }).collect(),
+                });
+
+                choices.push(crate::models::ChatCompletionChoice {
+                    index: i,
+                    message,
+                    finish_reason: Some(finish_reason),
+                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    logprobs,
+                    reasoning_content: reasoning,
+                });
             }
-            (StatusCode::OK, Json(resp)).into_response()
-        }
-        Err(e) => {
-            error!("Generation failed: {}", e);
-            e.into_response()
+            Err(e) => {
+                error!("Generation run {} failed: {}", i, e);
+                return e.into_response();
+            }
         }
     }
+
+    let usage = Usage { prompt_tokens: total_prompt, completion_tokens: total_completion, total_tokens: total_prompt + total_completion };
+    let resp = crate::models::ChatCompletionResponse {
+        id: chat_id,
+        object: "chat.completion",
+        created: crate::models::now_secs_pub(),
+        model: model_name,
+        choices,
+        usage,
+    };
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 const TOOL_SENTINEL: &str = "\x00TOOL_CALLS:";

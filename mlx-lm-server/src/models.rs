@@ -8,6 +8,8 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+pub fn now_secs_pub() -> u64 { now_secs() }
+
 // ── Shared ────────────────────────────────────────────────────────────────────
 
 /// Per-part content for multimodal messages
