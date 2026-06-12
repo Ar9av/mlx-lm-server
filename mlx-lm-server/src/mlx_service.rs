@@ -417,12 +417,23 @@ impl MlxService {
                 if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                 if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
-                // Thinking budget logits processor
+                // Logits processors: collect all, then set once
+                let mut processors_list: Vec<PyObject> = Vec::new();
                 if let Some(budget) = sampler.thinking_budget {
                     if let Ok(proc) = make_thinking_budget_processor(py, tokenizer, budget) {
-                        let processors = PyList::new(py, &[proc]);
-                        kwargs.set_item("logits_processors", processors)?;
+                        processors_list.push(proc.into_py(py));
                     }
+                }
+                if let Some(ref bias_map) = sampler.logit_bias {
+                    if !bias_map.is_empty() {
+                        if let Ok(proc) = make_logit_bias_processor(py, bias_map) {
+                            processors_list.push(proc.into_py(py));
+                        }
+                    }
+                }
+                if !processors_list.is_empty() {
+                    let processors = PyList::new(py, &processors_list);
+                    kwargs.set_item("logits_processors", processors)?;
                 }
 
                 // Set up prompt and optional KV cache
@@ -600,12 +611,23 @@ impl MlxService {
                     if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                     if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
 
-                    // Thinking budget logits processor
+                    // Logits processors for streaming
+                    let mut stream_procs: Vec<PyObject> = Vec::new();
                     if let Some(budget) = sampler.thinking_budget {
                         if let Ok(proc) = make_thinking_budget_processor(py, tokenizer, budget) {
-                            let processors = PyList::new(py, &[proc]);
-                            kwargs.set_item("logits_processors", processors)?;
+                            stream_procs.push(proc.into_py(py));
                         }
+                    }
+                    if let Some(ref bias_map) = sampler.logit_bias {
+                        if !bias_map.is_empty() {
+                            if let Ok(proc) = make_logit_bias_processor(py, bias_map) {
+                                stream_procs.push(proc.into_py(py));
+                            }
+                        }
+                    }
+                    if !stream_procs.is_empty() {
+                        let processors = PyList::new(py, &stream_procs);
+                        kwargs.set_item("logits_processors", processors)?;
                     }
 
                     // Set up prompt with optional session KV cache
@@ -1320,6 +1342,38 @@ _thinking_budget_proc = _ThinkingBudgetProcessor(_tokenizer, _budget)
     locals.set_item("_budget", budget as i64)?;
     py.run(code, None, Some(locals))?;
     Ok(locals.get_item("_thinking_budget_proc")
+        .and_then(|o| o.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("processor not found")))?)
+}
+
+fn make_logit_bias_processor<'py>(
+    py: Python<'py>,
+    bias_map: &std::collections::HashMap<String, f64>,
+) -> PyResult<&'py PyAny> {
+    let bias_json = serde_json::to_string(bias_map).unwrap_or_else(|_| "{}".into());
+    let code = r#"
+import json as _json
+import mlx.core as _mx
+import numpy as _np
+
+class _LogitBiasProcessor:
+    def __init__(self, bias_map):
+        self.bias = {int(k): float(v) for k, v in bias_map.items()}
+
+    def __call__(self, tokens, logits):
+        if not self.bias:
+            return logits
+        arr = _np.array(logits.tolist(), dtype=_np.float32)
+        for tok_id, bias_val in self.bias.items():
+            if 0 <= tok_id < arr.shape[-1]:
+                arr[tok_id] += bias_val
+        return _mx.array(arr)
+
+_logit_bias_proc = _LogitBiasProcessor(_json.loads(_bias_json))
+"#;
+    let locals = PyDict::new(py);
+    locals.set_item("_bias_json", bias_json)?;
+    py.run(code, None, Some(locals))?;
+    Ok(locals.get_item("_logit_bias_proc")
         .and_then(|o| o.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("processor not found")))?)
 }
 

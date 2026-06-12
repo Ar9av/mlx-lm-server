@@ -89,6 +89,9 @@ pub struct SamplerParams {
     /// Max thinking tokens for reasoning models (Qwen3/DeepSeek-R1).
     /// Forces </think> after this many tokens in the reasoning block.
     pub thinking_budget: Option<usize>,
+    /// Map of token_id -> bias (-100 to 100). Positive biases increase likelihood,
+    /// negative decrease it. -100 effectively bans the token.
+    pub logit_bias: Option<std::collections::HashMap<String, f64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +185,7 @@ pub struct ChatCompletionRequest {
     pub xtc_threshold: Option<f64>,
     /// Max thinking tokens for reasoning models. Forces </think> after N tokens.
     pub thinking_budget: Option<usize>,
+    pub logit_bias: Option<std::collections::HashMap<String, f64>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
