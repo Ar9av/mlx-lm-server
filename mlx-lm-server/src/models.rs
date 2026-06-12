@@ -772,7 +772,7 @@ pub struct TrainRequest {
 fn default_fine_tune_type() -> String { "lora".into() }
 fn default_adapter_path() -> String { "./adapters".into() }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TrainProgress {
     pub event: &'static str,   // "progress" | "done" | "error"
     pub step: Option<usize>,
@@ -911,6 +911,26 @@ pub struct RerankResponse {
     pub results: Vec<RerankResult>,
     pub model: String,
     pub usage: Usage,
+}
+
+// ── Training job ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TrainingJob {
+    pub id: String,
+    pub object: &'static str,
+    pub status: String, // "pending" | "running" | "completed" | "failed" | "cancelled"
+    pub model: String,
+    pub fine_tune_type: String,
+    pub adapter_path: String,
+    pub created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    pub events: Vec<TrainProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ── Batch API ─────────────────────────────────────────────────────────────────
