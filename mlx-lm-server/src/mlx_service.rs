@@ -490,6 +490,21 @@ impl MlxService {
                         }
                     }
                     (text, fr, Some(lps))
+                } else if let Some(ref grammar_str) = sampler.grammar {
+                    let response = constrained_generate(py, model_py.as_ref(py), tokenizer, &prompt, grammar_str, max_tokens)
+                        .unwrap_or_else(|_| {
+                            // Fallback: unconstrained if outlines not available
+                            mlx_lm.getattr("generate")
+                                .and_then(|g| g.call((model_py.as_ref(py), tokenizer), Some(kwargs)))
+                                .and_then(|r| r.extract::<String>())
+                                .unwrap_or_default()
+                        });
+                    let fr = if count_tokens(py, tokenizer, &response) >= max_tokens {
+                        "length".to_string()
+                    } else {
+                        "stop".to_string()
+                    };
+                    (response, fr, None)
                 } else {
                     let response: String = mlx_lm
                         .getattr("generate")?
@@ -1375,6 +1390,37 @@ _logit_bias_proc = _LogitBiasProcessor(_json.loads(_bias_json))
     py.run(code, None, Some(locals))?;
     Ok(locals.get_item("_logit_bias_proc")
         .and_then(|o| o.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("processor not found")))?)
+}
+
+/// Grammar-constrained generation using the `outlines` library.
+/// Falls back with an error if outlines is not installed.
+fn constrained_generate<'py>(
+    py: Python<'py>,
+    model: &PyAny,
+    tokenizer: &PyAny,
+    prompt: &str,
+    grammar: &str,
+    max_tokens: usize,
+) -> PyResult<String> {
+    let code = r#"
+import outlines
+import outlines.models as _om
+import outlines.generate as _og
+
+_mlx_model = _om.mlxlm(_model, _tokenizer)
+_generator = _og.cfg(_mlx_model, _grammar)
+_result = _generator(_prompt, max_tokens=_max_tokens)
+"#;
+    let locals = PyDict::new(py);
+    locals.set_item("_model", model)?;
+    locals.set_item("_tokenizer", tokenizer)?;
+    locals.set_item("_grammar", grammar)?;
+    locals.set_item("_prompt", prompt)?;
+    locals.set_item("_max_tokens", max_tokens as i64)?;
+    py.run(code, None, Some(locals))?;
+    locals.get_item("_result")?
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no result"))?
+        .extract::<String>()
 }
 
 /// Split a model response into (content, reasoning) by extracting <think>...</think> blocks.

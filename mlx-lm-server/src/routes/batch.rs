@@ -124,6 +124,7 @@ pub async fn create_batch(
                 xtc_threshold: chat_req.xtc_threshold,
                 thinking_budget: chat_req.thinking_budget,
                 logit_bias: chat_req.logit_bias.clone(),
+                grammar: chat_req.grammar.clone(),
             };
             let chat_template_kwargs = chat_req.chat_template_kwargs.clone();
             let kv_bits = chat_req.kv_bits;
