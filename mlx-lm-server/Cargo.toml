@@ -29,3 +29,4 @@ tokio-stream = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
+prometheus = { workspace = true }

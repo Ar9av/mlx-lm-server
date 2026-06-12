@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod metrics;
 mod mlx_service;
 mod models;
 mod routes;
@@ -9,12 +10,13 @@ use axum::{
     extract::Request,
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
 };
 use state::AppState;
 use std::net::SocketAddr;
+use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -37,8 +39,29 @@ async fn request_id_middleware(req: Request, next: Next) -> Response {
     resp
 }
 
+async fn metrics_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let start = Instant::now();
+    metrics::inc_active();
+    let resp = next.run(req).await;
+    metrics::dec_active();
+    let status = resp.status().as_u16();
+    metrics::inc_request(&path, &method, status);
+    metrics::observe_duration(&path, start.elapsed().as_secs_f64());
+    resp
+}
+
+async fn metrics_handler() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        metrics::render(),
+    )
+}
+
 #[tokio::main]
 async fn main() {
+    metrics::init();
     let cfg = config::Config::from_env();
 
     let level = if cfg.debug { "debug" } else { "info" };
@@ -65,6 +88,7 @@ async fn main() {
         .route("/health", get(routes::health::health))
         .route("/status", get(routes::health::status))
         .route("/llms.txt", get(routes::health::llms_txt))
+        .route("/metrics", get(metrics_handler))
         // OpenAI-compatible
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
@@ -107,6 +131,7 @@ async fn main() {
         // Pipeline
         .route("/v1/pipeline", post(routes::pipeline::run_pipeline))
         // Middleware
+        .layer(middleware::from_fn(metrics_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(cors)
         .with_state(state.clone());
