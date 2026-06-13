@@ -97,6 +97,15 @@ pub struct SamplerParams {
     /// EBNF grammar string for grammar-constrained generation via outlines.
     /// Overrides response_format if both are set.
     pub grammar: Option<String>,
+    /// Mirostat v2 sampling — adapts temperature each step to target perplexity `mirostat_tau`.
+    /// Set to true to enable; uses `mirostat_tau` (default 5.0) and `mirostat_eta` (default 0.1).
+    pub mirostat: Option<bool>,
+    pub mirostat_tau: Option<f64>,
+    pub mirostat_eta: Option<f64>,
+    /// Dynamic temperature — scales temperature by entropy of the current logit distribution.
+    /// `dynatemp_range` sets the max scaling factor; `dynatemp_exponent` shapes the curve.
+    pub dynatemp_range: Option<f64>,
+    pub dynatemp_exponent: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +205,11 @@ pub struct ChatCompletionRequest {
     /// "low" → 512 tokens, "medium" → 2048, "high" → 8192.
     /// Ignored if thinking_budget is also set explicitly.
     pub reasoning_effort: Option<String>,
+    pub mirostat: Option<bool>,
+    pub mirostat_tau: Option<f64>,
+    pub mirostat_eta: Option<f64>,
+    pub dynatemp_range: Option<f64>,
+    pub dynatemp_exponent: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
