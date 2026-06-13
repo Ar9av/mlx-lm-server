@@ -94,6 +94,7 @@ async fn main() {
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
         .route("/v1/tokenize", post(routes::chat::tokenize))
+        .route("/infill", post(routes::infill::infill))
         .route("/v1/detokenize", post(routes::chat::detokenize))
         .route("/v1/apply-template", post(routes::chat::apply_template))
         .route("/v1/models", get(routes::models::list_models))
