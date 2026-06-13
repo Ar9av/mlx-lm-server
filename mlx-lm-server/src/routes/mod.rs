@@ -10,5 +10,6 @@ pub mod health;
 pub mod models;
 pub mod pipeline;
 pub mod rerank;
+pub mod responses;
 pub mod train;
 pub mod vector_store;
