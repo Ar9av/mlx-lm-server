@@ -147,8 +147,11 @@ pub async fn chat_completions(
             Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),
     };
 
+    let keep_alive = req.keep_alive;
     if req.stream.unwrap_or(false) {
-        stream_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit).await
+        let resp = stream_response(state.clone(), req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit).await;
+        state.mlx.touch_keep_alive(keep_alive);
+        resp
     } else {
         sync_response(state, req, messages, max_tokens, sampler, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id, permit, n).await
     }
@@ -290,6 +293,8 @@ async fn sync_response(
             reasoning_content: reasoning,
         });
     }
+
+    state.mlx.touch_keep_alive(req.keep_alive);
 
     let usage = Usage { prompt_tokens: total_prompt, completion_tokens: total_completion, total_tokens: total_prompt + total_completion };
     let resp = crate::models::ChatCompletionResponse {

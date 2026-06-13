@@ -116,6 +116,8 @@ async fn main() {
         // OpenAI Responses API (stateful conversations)
         .route("/v1/responses", post(routes::responses::create_response).get(routes::responses::list_responses))
         .route("/v1/responses/:id", get(routes::responses::get_response).delete(routes::responses::delete_response))
+        // Loaded models with TTL
+        .route("/v1/models/loaded", get(routes::models::list_loaded_models))
         // Model cache + discovery
         .route("/api/models/local", get(routes::models::list_local_models))
         .route("/api/models/local/:org/*model", delete(routes::models::delete_local_model))
@@ -178,6 +180,34 @@ async fn main() {
                     Err(e) => tracing::warn!("Warm-up: failed to parse {}: {}", warm_file, e),
                 },
                 Err(e) => tracing::warn!("Warm-up: cannot read {}: {}", warm_file, e),
+            }
+        });
+    }
+
+    // Background TTL watcher: auto-unload model when keep_alive expires
+    {
+        use std::sync::atomic::Ordering;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ttl_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                if !ttl_state.mlx.is_loaded().await {
+                    continue;
+                }
+                let ka = ttl_state.mlx.keep_alive_secs.load(Ordering::Relaxed);
+                if ka < 0 {
+                    continue; // never auto-unload
+                }
+                let last = ttl_state.mlx.last_used_at.load(Ordering::Relaxed);
+                if last == 0 {
+                    continue; // model loaded but never used yet; don't auto-unload
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                if now.saturating_sub(last) >= ka as u64 {
+                    info!("keep_alive TTL expired ({}s idle), unloading model", ka);
+                    ttl_state.mlx.unload_model().await;
+                }
             }
         });
     }
