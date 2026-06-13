@@ -192,6 +192,10 @@ pub struct ChatCompletionRequest {
     pub thinking_budget: Option<usize>,
     pub logit_bias: Option<std::collections::HashMap<String, f64>>,
     pub grammar: Option<String>,
+    /// OpenAI o-series / Anthropic reasoning effort level.
+    /// "low" → 512 tokens, "medium" → 2048, "high" → 8192.
+    /// Ignored if thinking_budget is also set explicitly.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]

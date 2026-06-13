@@ -111,7 +111,13 @@ pub async fn chat_completions(
         num_draft_tokens: req.num_draft_tokens,
         xtc_probability: req.xtc_probability,
         xtc_threshold: req.xtc_threshold,
-        thinking_budget: req.thinking_budget,
+        thinking_budget: req.thinking_budget.or_else(|| {
+            req.reasoning_effort.as_deref().map(|e| match e {
+                "low"    => 512,
+                "high"   => 8192,
+                _        => 2048, // "medium" and any unknown value
+            })
+        }),
         logit_bias: req.logit_bias.clone(),
         grammar: req.grammar.clone(),
     };
