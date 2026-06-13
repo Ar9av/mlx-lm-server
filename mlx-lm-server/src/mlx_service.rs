@@ -447,6 +447,60 @@ impl MlxService {
         .map_err(|e: PyErr| MlxError::Python(e.to_string()))
     }
 
+    /// Validate `content` as JSON and (if `schema` is Some and non-null) against the given
+    /// JSON Schema using Python's `jsonschema` library.  Returns Ok(()) on success, or an
+    /// Err(String) describing the first validation error.
+    pub async fn validate_json_schema(
+        &self,
+        content: String,
+        schema: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        // Strip special tokens and markdown code fences the model may emit
+        let stripped_tokens = content
+            .replace("<|im_end|>", "")
+            .replace("<|endoftext|>", "")
+            .replace("<|end|>", "")
+            .replace("</s>", "");
+        let trimmed = stripped_tokens.trim();
+        let json_str = if let Some(s) = trimmed.strip_prefix("```json") {
+            s.trim_end_matches('`').trim()
+        } else if let Some(s) = trimmed.strip_prefix("```") {
+            s.trim_end_matches('`').trim()
+        } else {
+            trimmed
+        };
+
+        // Must be valid JSON first
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| format!("Invalid JSON: {}", e))?;
+
+        let schema_val = match schema {
+            Some(s) if !s.is_null() => s,
+            _ => return Ok(()),
+        };
+
+        let schema_str = serde_json::to_string(&schema_val).map_err(|e| e.to_string())?;
+        let instance_str = serde_json::to_string(&parsed).map_err(|e| e.to_string())?;
+
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> Result<(), String> {
+                let code = "import json, jsonschema\njsonschema.validate(json.loads(instance_str), json.loads(schema_str))";
+                let globals = pyo3::types::PyDict::new(py);
+                globals.set_item("instance_str", instance_str.as_str()).map_err(|e| e.to_string())?;
+                globals.set_item("schema_str", schema_str.as_str()).map_err(|e| e.to_string())?;
+                py.run(code, Some(globals), None).map_err(|e: PyErr| {
+                    e.value(py)
+                        .str()
+                        .ok()
+                        .and_then(|s| s.to_str().ok().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "JSON schema validation failed".to_string())
+                })
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     pub async fn get_embeddings(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MlxError> {
         let (model_py, tokenizer_py, _) = self.get_model_refs().await?;
         tokio::task::spawn_blocking(move || {
