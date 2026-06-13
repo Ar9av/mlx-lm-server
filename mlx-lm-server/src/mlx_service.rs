@@ -386,6 +386,39 @@ impl MlxService {
         .map_err(|e: PyErr| MlxError::Python(e.to_string()))
     }
 
+    pub async fn detokenize(&self, tokens: Vec<i64>) -> Result<String, MlxError> {
+        let (_, tokenizer_py, _) = self.get_model_refs().await?;
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<String> {
+                tokenizer_py.as_ref(py).call_method1("decode", (tokens,))?.extract()
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))
+    }
+
+    pub async fn apply_chat_template_prompt(
+        &self,
+        messages: Vec<crate::models::ChatMessage>,
+        add_generation_prompt: bool,
+    ) -> Result<(String, usize), MlxError> {
+        let (_, tokenizer_py, _) = self.get_model_refs().await?;
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<(String, usize)> {
+                let tokenizer = tokenizer_py.as_ref(py);
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("add_generation_prompt", add_generation_prompt)?;
+                let prompt = apply_chat_template(py, tokenizer, &messages, &serde_json::Value::Null, None)?;
+                let token_count = count_tokens(py, tokenizer, &prompt);
+                Ok((prompt, token_count))
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))
+    }
+
     pub async fn get_embeddings(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MlxError> {
         let (model_py, tokenizer_py, _) = self.get_model_refs().await?;
         tokio::task::spawn_blocking(move || {
