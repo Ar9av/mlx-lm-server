@@ -26,6 +26,10 @@ pub struct Config {
     pub warm_prompts_file: Option<String>,
     /// Interval in seconds for SSE keep-alive comments during long prefill.
     pub keepalive_secs: u64,
+    /// Automatically cache KV state for common prompt prefixes (system messages).
+    pub enable_apc: bool,
+    /// Maximum number of prefix snapshots to keep (LRU eviction when exceeded).
+    pub apc_max_entries: usize,
 }
 
 impl Config {
@@ -54,6 +58,8 @@ impl Config {
             context_scale: env_f64("MLX_CONTEXT_SCALE", 1.0),
             warm_prompts_file: env_opt_str("MLX_WARM_PROMPTS"),
             keepalive_secs: env_usize("MLX_KEEPALIVE_SECS", 15) as u64,
+            enable_apc: env_bool("MLX_ENABLE_APC", true),
+            apc_max_entries: env_usize("MLX_APC_MAX_ENTRIES", 32),
         }
     }
 }

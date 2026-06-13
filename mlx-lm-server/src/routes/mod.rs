@@ -9,6 +9,7 @@ pub mod finetune;
 pub mod health;
 pub mod models;
 pub mod pipeline;
+pub mod prefix_cache;
 pub mod rerank;
 pub mod responses;
 pub mod train;
