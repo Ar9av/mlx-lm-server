@@ -125,6 +125,9 @@ async fn main() {
         .route("/api/ps", get(routes::models::ps))
         // Automatic Prefix Cache (APC)
         .route("/v1/prefix_cache", get(routes::prefix_cache::get_prefix_cache_stats).delete(routes::prefix_cache::clear_prefix_cache))
+        .route("/v1/prefix_cache/save", post(routes::prefix_cache::save_prefix_cache))
+        .route("/v1/prefix_cache/load", post(routes::prefix_cache::load_prefix_cache))
+        .route("/v1/prefix_cache/saved", delete(routes::prefix_cache::erase_prefix_cache_file))
         // Prompt cache sessions
         .route("/v1/sessions/:session_id", delete(routes::chat::delete_session))
         // Benchmarking

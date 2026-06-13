@@ -34,6 +34,8 @@ pub struct Config {
     /// Requests can override per-call with the `keep_alive` field.
     /// Set to 0 to unload immediately; set to u64::MAX to never auto-unload.
     pub default_keep_alive_secs: u64,
+    /// Default file path for prefix-cache save/load.  None = no default path.
+    pub kv_persist_path: Option<String>,
 }
 
 impl Config {
@@ -65,6 +67,7 @@ impl Config {
             enable_apc: env_bool("MLX_ENABLE_APC", true),
             apc_max_entries: env_usize("MLX_APC_MAX_ENTRIES", 32),
             default_keep_alive_secs: env_usize("MLX_KEEP_ALIVE_SECS", 300) as u64,
+            kv_persist_path: env_opt_str("MLX_KV_PERSIST_PATH"),
         }
     }
 }
