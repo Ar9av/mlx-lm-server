@@ -110,6 +110,9 @@ async fn main() {
         .route("/v1/convert", post(routes::finetune::convert))
         // Anthropic-compatible
         .route("/v1/messages", post(routes::anthropic::messages))
+        // OpenAI Responses API (stateful conversations)
+        .route("/v1/responses", post(routes::responses::create_response).get(routes::responses::list_responses))
+        .route("/v1/responses/:id", get(routes::responses::get_response).delete(routes::responses::delete_response))
         // Model cache + discovery
         .route("/api/models/local", get(routes::models::list_local_models))
         .route("/api/models/local/:org/*model", delete(routes::models::delete_local_model))
