@@ -72,14 +72,48 @@ pub struct MlxService {
 impl MlxService {
     pub fn new(config: Arc<Config>) -> Self {
         let default_ka = config.default_keep_alive_secs as i64;
-        Self {
+        let svc = Self {
             inner: Arc::new(Mutex::new(Inner { loaded: None, adapters: HashMap::new(), prompt_sessions: HashMap::new() })),
             prefix_cache: Arc::new(StdMutex::new(HashMap::new())),
             last_used_at: Arc::new(AtomicU64::new(0)),
             keep_alive_secs: Arc::new(AtomicI64::new(default_ka)),
             active_requests: Arc::new(StdMutex::new(HashMap::new())),
-            config,
-        }
+            config: Arc::clone(&config),
+        };
+        // Apply Metal memory management: cache limit (user-configured or default 512 MB)
+        // and memory limit (80% of physical RAM) to prevent unbounded growth and OOM panics.
+        let cache_limit_gb = config.metal_cache_limit_gb;
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = Python::with_gil(|py| -> PyResult<()> {
+                let metal = py.import("mlx.core")?.getattr("metal")?;
+
+                // cache limit: how much buffer the Metal allocator keeps recycled
+                // 1 GB lets typical KV cache tensors recycle between sequential requests.
+                let cache_bytes = cache_limit_gb
+                    .map(|gb| (gb * 1e9) as usize)
+                    .unwrap_or(1024 * 1024 * 1024); // default 1 GB
+                metal.call_method1("set_cache_limit", (cache_bytes,))?;
+
+                // memory limit: soft ceiling at 80% of physical RAM
+                let device_info = metal.call_method0("device_info")?;
+                let ram_bytes: usize = py
+                    .eval("__import__('mlx.core', fromlist=['metal']).metal.device_info().get('memory_size', 0)", None, None)
+                    .and_then(|v| v.extract::<usize>())
+                    .unwrap_or(0);
+                if ram_bytes > 0 {
+                    let mem_limit = (ram_bytes as f64 * 0.80) as usize;
+                    let _ = metal.call_method1("set_memory_limit", (mem_limit,));
+                    info!(
+                        "Metal: cache_limit={}MB  memory_limit={}GB  (physical={}GB)",
+                        cache_bytes / 1024 / 1024,
+                        mem_limit / 1024 / 1024 / 1024,
+                        ram_bytes / 1024 / 1024 / 1024,
+                    );
+                }
+                Ok(())
+            });
+        });
+        svc
     }
 
     /// Register a cancellable streaming request; returns the flag to pass into the generation loop.
@@ -246,6 +280,33 @@ impl MlxService {
             draft_model: draft_model_py,
         });
         info!("Model loaded successfully");
+
+        // Auto warm-up: pre-compile Metal shaders and prime the KV allocator with a
+        // 1-token dummy inference so the very first real request skips cold-start overhead.
+        if self.config.auto_warm {
+            let svc = self.clone();
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                let warmup_msg = vec![crate::models::ChatMessage {
+                    role: "user".into(),
+                    content: crate::models::MessageContent::Text("Hi".into()),
+                }];
+                let sampler = crate::models::SamplerParams {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    ..Default::default()
+                };
+                let _ = svc.generate_response(
+                    warmup_msg,
+                    1,
+                    sampler,
+                    serde_json::Value::Object(Default::default()),
+                    None, None, None, None, vec![], false, 0, None, None,
+                ).await;
+                info!("Auto warm-up done in {:.0}ms", t0.elapsed().as_millis());
+            });
+        }
+
         Ok(())
     }
 
@@ -698,6 +759,9 @@ impl MlxService {
     ) -> Result<(String, usize, usize), MlxError> {
         let (model_py, tokenizer_py, _) = self.get_model_refs_for(adapter_name.as_deref()).await?;
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
+        let effective_kv_bits = kv_bits.or(self.config.default_kv_bits);
+        let prefill_step_size = self.config.prefill_step_size;
+        let quantized_kv_start = self.config.quantized_kv_start;
 
         tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<(String, usize, usize)> {
@@ -709,9 +773,11 @@ impl MlxService {
                 kwargs.set_item("prompt", prompt.as_str())?;
                 kwargs.set_item("max_tokens", max_tokens as i64)?;
                 kwargs.set_item("sampler", py_sampler)?;
-                if let Some(bits) = kv_bits {
+                kwargs.set_item("prefill_step_size", prefill_step_size)?;
+                if let Some(bits) = effective_kv_bits {
                     kwargs.set_item("kv_bits", bits)?;
                     kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                    kwargs.set_item("quantized_kv_start", quantized_kv_start)?;
                 }
                 if let Some(v) = sampler.presence_penalty { kwargs.set_item("presence_penalty", v)?; }
                 if let Some(v) = sampler.frequency_penalty { kwargs.set_item("frequency_penalty", v)?; }
@@ -745,6 +811,9 @@ impl MlxService {
         session_id: Option<String>,
     ) -> Result<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>, Option<String>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
+        let effective_kv_bits = kv_bits.or(self.config.default_kv_bits);
+        let prefill_step_size = self.config.prefill_step_size;
+        let quantized_kv_start = self.config.quantized_kv_start;
 
         // Extract prefix messages for APC before `messages` is moved into spawn_blocking
         let apc_prefix_msgs = if self.config.enable_apc && session_id.is_none() {
@@ -803,9 +872,11 @@ impl MlxService {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("max_tokens", max_tokens as i64)?;
                 kwargs.set_item("sampler", py_sampler)?;
-                if let Some(bits) = kv_bits {
+                kwargs.set_item("prefill_step_size", prefill_step_size)?;
+                if let Some(bits) = effective_kv_bits {
                     kwargs.set_item("kv_bits", bits)?;
                     kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                    kwargs.set_item("quantized_kv_start", quantized_kv_start)?;
                 }
                 if let Some(ref draft) = draft_model_py {
                     kwargs.set_item("draft_model", draft.as_ref(py))?;
@@ -984,6 +1055,9 @@ impl MlxService {
         let cancel_flag = self.register_cancel(&request_id);
         let active_requests_ref = Arc::clone(&self.active_requests);
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
+        let effective_kv_bits = kv_bits.or(self.config.default_kv_bits);
+        let prefill_step_size = self.config.prefill_step_size;
+        let quantized_kv_start = self.config.quantized_kv_start;
 
         // Extract prefix messages for APC before `messages` is moved into spawn_blocking
         let apc_prefix_msgs = if self.config.enable_apc && session_id.is_none() {
@@ -1045,9 +1119,11 @@ impl MlxService {
                     let kwargs = PyDict::new(py);
                     kwargs.set_item("max_tokens", max_tokens as i64)?;
                     kwargs.set_item("sampler", py_sampler)?;
-                    if let Some(bits) = kv_bits {
+                    kwargs.set_item("prefill_step_size", prefill_step_size)?;
+                    if let Some(bits) = effective_kv_bits {
                         kwargs.set_item("kv_bits", bits)?;
                         kwargs.set_item("kv_group_size", kv_group_size.unwrap_or(64))?;
+                        kwargs.set_item("quantized_kv_start", quantized_kv_start)?;
                     }
                     if let Some(ref draft) = draft_model_py {
                         kwargs.set_item("draft_model", draft.as_ref(py))?;

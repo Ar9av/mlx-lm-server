@@ -36,6 +36,22 @@ pub struct Config {
     pub default_keep_alive_secs: u64,
     /// Default file path for prefix-cache save/load.  None = no default path.
     pub kv_persist_path: Option<String>,
+    /// Prefill chunk size passed to generate_step (default 512).
+    /// Larger = faster prefill; smaller = lower peak memory on long prompts.
+    pub prefill_step_size: usize,
+    /// After how many cached tokens to begin KV-cache quantization (0 = from the start).
+    /// Only active when kv_bits is set (per-request or via MLX_DEFAULT_KV_BITS).
+    pub quantized_kv_start: usize,
+    /// Server-level default KV quantization bits (4 or 8). None = no quantization unless
+    /// overridden per-request. Reduces KV memory ~2–4x with minimal quality loss.
+    pub default_kv_bits: Option<u32>,
+    /// Metal allocator cache limit in GB. None = server defaults to 1 GB (enough to
+    /// recycle KV buffers between sequential requests without holding excess RAM).
+    pub metal_cache_limit_gb: Option<f64>,
+    /// Run a 1-token dummy inference immediately after every model load to pre-compile
+    /// Metal shaders and warm up the KV allocator.  Eliminates the cold-start latency
+    /// spike on the very first user request.  Set to false to disable.
+    pub auto_warm: bool,
 }
 
 impl Config {
@@ -68,6 +84,11 @@ impl Config {
             apc_max_entries: env_usize("MLX_APC_MAX_ENTRIES", 32),
             default_keep_alive_secs: env_usize("MLX_KEEP_ALIVE_SECS", 300) as u64,
             kv_persist_path: env_opt_str("MLX_KV_PERSIST_PATH"),
+            prefill_step_size: env_usize("MLX_PREFILL_STEP_SIZE", 2048),
+            quantized_kv_start: env_usize("MLX_QUANTIZED_KV_START", 0),
+            default_kv_bits: env_opt_u32("MLX_DEFAULT_KV_BITS"),
+            metal_cache_limit_gb: env_opt_f64("MLX_METAL_CACHE_LIMIT_GB"),
+            auto_warm: env_bool("MLX_AUTO_WARM", true),
         }
     }
 }
