@@ -92,6 +92,7 @@ pub enum ModelType {
     Tts,
     Stt,
     Sts,
+    Vad,
 }
 
 impl std::fmt::Display for ModelType {
@@ -100,6 +101,7 @@ impl std::fmt::Display for ModelType {
             ModelType::Tts => write!(f, "tts"),
             ModelType::Stt => write!(f, "stt"),
             ModelType::Sts => write!(f, "sts"),
+            ModelType::Vad => write!(f, "vad"),
         }
     }
 }
@@ -126,6 +128,21 @@ pub struct ModelList {
     pub data: Vec<ModelObject>,
 }
 
+// ── VAD ───────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct VadSegment {
+    pub start: f64,
+    pub end: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VadResponse {
+    pub model: String,
+    pub segments: Vec<VadSegment>,
+    pub duration: f64,
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -134,4 +151,5 @@ pub struct HealthResponse {
     pub tts_model: Option<String>,
     pub stt_model: Option<String>,
     pub sts_model: Option<String>,
+    pub vad_model: Option<String>,
 }

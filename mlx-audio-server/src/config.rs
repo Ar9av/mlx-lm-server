@@ -13,6 +13,7 @@ pub struct Config {
     pub default_speed: f64,
     pub default_language: String,
     pub max_tts_chars: usize,
+    pub default_vad_model: String,
 }
 
 impl Config {
@@ -29,6 +30,7 @@ impl Config {
             default_speed: env_f64("MLX_AUDIO_DEFAULT_SPEED", 1.0),
             default_language: env_str("MLX_AUDIO_DEFAULT_LANGUAGE", "en"),
             max_tts_chars: env_usize("MLX_AUDIO_MAX_TTS_CHARS", 10_000),
+            default_vad_model: env_str("MLX_AUDIO_VAD_MODEL", "mlx-community/silero-vad"),
         }
     }
 }

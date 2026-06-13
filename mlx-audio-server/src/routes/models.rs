@@ -19,6 +19,9 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
     if let Some(id) = state.audio.sts_model_id().await {
         data.push(ModelObject::new(id, ModelType::Sts));
     }
+    if let Some(id) = state.audio.vad_model_id().await {
+        data.push(ModelObject::new(id, ModelType::Vad));
+    }
     Json(ModelList { object: "list", data })
 }
 
@@ -30,6 +33,7 @@ pub async fn load_model(
         ModelType::Tts => state.audio.load_tts(req.model).await?,
         ModelType::Stt => state.audio.load_stt(req.model).await?,
         ModelType::Sts => state.audio.load_sts(req.model).await?,
+        ModelType::Vad => state.audio.load_vad(req.model).await?,
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -42,6 +46,7 @@ pub async fn unload_model(
         "tts" => state.audio.unload_tts().await,
         "stt" => state.audio.unload_stt().await,
         "sts" => state.audio.unload_sts().await,
+        "vad" => state.audio.unload_vad().await,
         other => return Err(AudioError::Internal(format!("Unknown model type: {}", other))),
     }
     Ok(StatusCode::NO_CONTENT)
