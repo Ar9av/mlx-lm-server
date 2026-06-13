@@ -7,6 +7,7 @@ pub mod completions;
 pub mod embeddings;
 pub mod finetune;
 pub mod health;
+pub mod infill;
 pub mod models;
 pub mod pipeline;
 pub mod prefix_cache;

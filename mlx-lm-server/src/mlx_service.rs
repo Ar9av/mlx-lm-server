@@ -386,6 +386,34 @@ impl MlxService {
         .map_err(|e: PyErr| MlxError::Python(e.to_string()))
     }
 
+    /// Build a Fill-in-the-Middle prompt using FIM tokens detected from the model's vocab.
+    pub async fn build_fim_prompt(
+        &self,
+        prefix: String,
+        suffix: String,
+        extra: Vec<(String, String)>,
+    ) -> Result<String, MlxError> {
+        let (_, tokenizer_py, _) = self.get_model_refs().await?;
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<String> {
+                let tokenizer = tokenizer_py.as_ref(py);
+                let vocab: std::collections::HashMap<String, i64> = tokenizer
+                    .call_method0("get_vocab")
+                    .and_then(|v| v.extract())
+                    .unwrap_or_default();
+                let (pre_tok, suf_tok, mid_tok) = detect_fim_tokens_inner(&vocab);
+                let extra_block: String = extra.iter()
+                    .map(|(fname, text)| format!("# {}\n{}\n", fname, text))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(format!("{}{}{}{}{}{}", extra_block, pre_tok, prefix, suf_tok, suffix, mid_tok))
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))
+    }
+
     pub async fn detokenize(&self, tokens: Vec<i64>) -> Result<String, MlxError> {
         let (_, tokenizer_py, _) = self.get_model_refs().await?;
         tokio::task::spawn_blocking(move || {
@@ -1918,6 +1946,22 @@ async fn fetch_model_size_gb(model_id: &str) -> Option<f64> {
     resp.get("usedStorage")
         .and_then(|v| v.as_f64())
         .map(|b| b / 1_073_741_824.0)
+}
+
+// ── FIM helpers ──────────────────────────────────────────────────────────────
+
+fn detect_fim_tokens_inner(vocab: &std::collections::HashMap<String, i64>) -> (&'static str, &'static str, &'static str) {
+    if vocab.contains_key("<|fim_prefix|>") {
+        ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")   // Qwen2.5-Coder, DeepSeek-Coder-V2
+    } else if vocab.contains_key("<fim_prefix>") {
+        ("<fim_prefix>", "<fim_suffix>", "<fim_middle>")          // StarCoder / StarCoder2
+    } else if vocab.contains_key("<|fim_begin|>") {
+        ("<|fim_begin|>", "<|fim_hole|>", "<|fim_end|>")          // DeepSeek-Coder v1
+    } else if vocab.contains_key("<PRE>") {
+        ("<PRE>", "<SUF>", "<MID>")                               // CodeLlama
+    } else {
+        ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")    // generic fallback
+    }
 }
 
 // ── APC helpers ──────────────────────────────────────────────────────────────
