@@ -122,7 +122,7 @@ async fn stream_messages(
     let timeout = state.config.stream_timeout;
 
     let (token_stream, _) = match state.mlx.generate_stream(
-        messages, max_tokens, sampler, timeout,
+        msg_id.clone(), messages, max_tokens, sampler, timeout,
         serde_json::Value::Object(Default::default()), kv_bits, kv_group_size, adapter_name, None, vec![], false, 0, None, None,
     ).await {
         Ok(s) => s,

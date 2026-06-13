@@ -1,4 +1,5 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::{Path, State}, http::StatusCode, response::IntoResponse, Json};
+use serde_json::json;
 use tracing::info;
 
 use crate::mlx_service::MlxService;
@@ -54,5 +55,20 @@ pub async fn completions(
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => e.into_response(),
+    }
+}
+
+/// DELETE /v1/completions/{request_id} — cancel a running streaming generation.
+///
+/// The `request_id` is the `id` field returned in the first SSE chunk (e.g. `chatcmpl-xxxx`).
+/// Returns 200 if found+cancelled, 404 if the request is not currently active.
+pub async fn cancel_completion(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> impl IntoResponse {
+    if state.mlx.cancel_request(&request_id) {
+        (StatusCode::OK, Json(json!({"cancelled": request_id}))).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({"error": "request not found or already completed", "id": request_id}))).into_response()
     }
 }
