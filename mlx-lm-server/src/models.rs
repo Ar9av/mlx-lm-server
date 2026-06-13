@@ -467,6 +467,31 @@ pub struct TokenizeResponse {
     pub count: usize,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DetokenizeRequest {
+    pub model: Option<String>,
+    pub tokens: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DetokenizeResponse {
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplyTemplateRequest {
+    pub model: Option<String>,
+    pub messages: Vec<crate::models::ChatMessage>,
+    #[serde(default)]
+    pub add_generation_prompt: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApplyTemplateResponse {
+    pub prompt: String,
+    pub token_count: usize,
+}
+
 // ── Embeddings ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

@@ -13,7 +13,7 @@ use tracing::{error, info};
 use crate::error::MlxError;
 use crate::metrics;
 use crate::mlx_service::{MlxService, MAX_MESSAGE_TOKENS};
-use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, LogprobsInfo, MessageContent, SamplerParams, StopSequence, TokenizeRequest, TokenizeResponse, TokenLogprob, TopLogprob, Tool, ToolCall, Usage};
+use crate::models::{ApplyTemplateRequest, ApplyTemplateResponse, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, DetokenizeRequest, DetokenizeResponse, LogprobsInfo, MessageContent, SamplerParams, StopSequence, TokenizeRequest, TokenizeResponse, TokenLogprob, TopLogprob, Tool, ToolCall, Usage};
 use crate::state::AppState;
 
 pub async fn chat_completions(
@@ -402,6 +402,28 @@ pub async fn delete_session(
 ) -> impl IntoResponse {
     state.mlx.delete_prompt_session(&session_id).await;
     (StatusCode::OK, Json(serde_json::json!({"deleted": session_id}))).into_response()
+}
+
+pub async fn detokenize(
+    State(state): State<AppState>,
+    Json(req): Json<DetokenizeRequest>,
+) -> impl IntoResponse {
+    match state.mlx.detokenize(req.tokens).await {
+        Ok(text) => (StatusCode::OK, Json(DetokenizeResponse { text })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub async fn apply_template(
+    State(state): State<AppState>,
+    Json(req): Json<ApplyTemplateRequest>,
+) -> impl IntoResponse {
+    match state.mlx.apply_chat_template_prompt(req.messages, req.add_generation_prompt).await {
+        Ok((prompt, token_count)) => {
+            (StatusCode::OK, Json(ApplyTemplateResponse { prompt, token_count })).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Route a streaming token to either content or reasoning_content based on <think> tag state.
