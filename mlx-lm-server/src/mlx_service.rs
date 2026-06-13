@@ -4,7 +4,9 @@ use crate::models::{ChatMessage, MountedAdapterInfo, SamplerParams, Tool, ToolCa
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -39,6 +41,13 @@ struct PromptSession {
     cached_tokens: usize,
 }
 
+pub struct PrefixEntry {
+    pub snapshot: Py<PyAny>,  // deep-copied KV cache frozen at prefix boundary
+    pub token_count: usize,   // tokens in the snapshot
+    pub last_hit: u64,        // unix secs for LRU eviction
+    pub hits: u64,
+}
+
 struct Inner {
     loaded: Option<LoadedModel>,
     adapters: HashMap<String, MountedAdapter>,
@@ -48,6 +57,8 @@ struct Inner {
 #[derive(Clone)]
 pub struct MlxService {
     inner: Arc<Mutex<Inner>>,
+    /// Prefix cache uses std::sync::Mutex so spawn_blocking closures can write to it directly.
+    pub prefix_cache: Arc<StdMutex<HashMap<u64, PrefixEntry>>>,
     config: Arc<Config>,
 }
 
@@ -55,6 +66,7 @@ impl MlxService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner { loaded: None, adapters: HashMap::new(), prompt_sessions: HashMap::new() })),
+            prefix_cache: Arc::new(StdMutex::new(HashMap::new())),
             config,
         }
     }
@@ -165,6 +177,9 @@ impl MlxService {
             .unwrap_or_default()
             .as_secs();
 
+        // Clear prefix cache when model changes (cached KV blocks are model-specific)
+        self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
         let mut guard = self.inner.lock().await;
         guard.loaded = Some(LoadedModel {
             model: model_py,
@@ -247,6 +262,116 @@ impl MlxService {
 
     pub async fn delete_prompt_session(&self, session_id: &str) {
         self.inner.lock().await.prompt_sessions.remove(session_id);
+    }
+
+    // ── Automatic Prefix Caching ──────────────────────────────────────────────
+
+    /// Try to find a matching prefix snapshot in the APC cache and return a deep copy.
+    pub async fn try_prefix_cache_hit(&self, prefix_msgs: &[ChatMessage]) -> Option<(Py<PyAny>, usize)> {
+        if prefix_msgs.is_empty() {
+            return None;
+        }
+        let hash = hash_messages(prefix_msgs);
+        let (snapshot_ref, token_count) = {
+            let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = cache.get_mut(&hash)?;
+            entry.last_hit = unix_secs();
+            entry.hits += 1;
+            let r = Python::with_gil(|py| entry.snapshot.clone_ref(py));
+            (r, entry.token_count)
+        };
+        // Deep-copy the snapshot so each request gets its own mutable copy
+        let deep_copy = tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+                let copy_mod = py.import("copy")?;
+                let deep = copy_mod.call_method1("deepcopy", (snapshot_ref.as_ref(py),))?;
+                Ok(deep.into_py(py))
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        info!("APC: cache hit ({} tokens)", token_count);
+        Some((deep_copy, token_count))
+    }
+
+    /// Build a KV snapshot for the given prefix messages and store it in the APC cache.
+    /// Runs Python in the background; does not block inference.
+    pub async fn build_and_store_prefix_snapshot(
+        &self,
+        prefix_msgs: Vec<ChatMessage>,
+        model_py: Py<PyAny>,
+        tokenizer_py: Py<PyAny>,
+        chat_template_kwargs: serde_json::Value,
+    ) {
+        if prefix_msgs.is_empty() {
+            return;
+        }
+        let hash = hash_messages(&prefix_msgs);
+        if self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&hash) {
+            return;
+        }
+        let apc_max = self.config.apc_max_entries;
+        let prefix_cache = Arc::clone(&self.prefix_cache);
+
+        tokio::task::spawn_blocking(move || {
+            let result = Python::with_gil(|py| -> PyResult<(Py<PyAny>, usize)> {
+                let _ = py.import("mlx.core").and_then(|mx| mx.call_method0("synchronize"));
+                let tokenizer = tokenizer_py.as_ref(py);
+
+                // Format prefix with add_generation_prompt=false to count exact prefix tokens
+                let prefix_prompt = format_prefix_only(py, tokenizer, &prefix_msgs)?;
+                let prefix_token_count = count_tokens(py, tokenizer, &prefix_prompt);
+                if prefix_token_count == 0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err("empty prefix prompt"));
+                }
+
+                // Create an empty KV cache and fill it with the prefix tokens via 1-token generation
+                let cache_mod = py.import("mlx_lm.models.cache")?;
+                let new_cache = cache_mod.call_method1("make_prompt_cache", (model_py.as_ref(py),))?;
+                let new_cache: Py<PyAny> = new_cache.into_py(py);
+
+                // Tokenize prefix to an mlx array (required format when prompt_cache is set)
+                let mx = py.import("mlx.core")?;
+                let all_ids: Vec<i64> = tokenizer.call_method1("encode", (&prefix_prompt,))?.extract()?;
+                let prompt_arr = mx.call_method1("array", (all_ids,))?;
+
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("max_tokens", 1i64)?;
+                kwargs.set_item("verbose", false)?;
+                kwargs.set_item("prompt", prompt_arr)?;
+                kwargs.set_item("prompt_cache", new_cache.as_ref(py))?;
+
+                let mlx_lm = py.import("mlx_lm")?;
+                mlx_lm.call_method("generate", (model_py.as_ref(py), tokenizer), Some(kwargs))?;
+
+                // Trim back to prefix_token_count (removes the 1 generated output token)
+                let _ = cache_mod.call_method1(
+                    "trim_prompt_cache",
+                    (new_cache.as_ref(py), prefix_token_count as i64),
+                );
+
+                // Deep-copy to create an immutable snapshot independent of future mutations
+                let copy_mod = py.import("copy")?;
+                let snapshot = copy_mod.call_method1("deepcopy", (new_cache.as_ref(py),))?;
+                Ok((snapshot.into_py(py), prefix_token_count))
+            });
+
+            match result {
+                Ok((snapshot, token_count)) => {
+                    let mut cache = prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    // LRU eviction when at capacity
+                    if cache.len() >= apc_max && !cache.contains_key(&hash) {
+                        if let Some(oldest) = cache.iter().min_by_key(|(_, e)| e.last_hit).map(|(&k, _)| k) {
+                            cache.remove(&oldest);
+                        }
+                    }
+                    cache.insert(hash, PrefixEntry { snapshot, token_count, last_hit: unix_secs(), hits: 0 });
+                    info!("APC: stored prefix snapshot ({} tokens, {} entries)", token_count, cache.len());
+                }
+                Err(e) => warn!("APC: failed to build prefix snapshot: {}", e),
+            }
+        });
     }
 
     pub async fn tokenize(&self, text: String) -> Result<Vec<i64>, MlxError> {
@@ -369,17 +494,39 @@ impl MlxService {
     ) -> Result<(String, usize, usize, Vec<ToolCall>, String, Option<Vec<serde_json::Value>>, Option<String>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
 
-        // Get or create session KV cache
+        // Extract prefix messages for APC before `messages` is moved into spawn_blocking
+        let apc_prefix_msgs = if self.config.enable_apc && session_id.is_none() {
+            extract_prefix_messages(&messages)
+        } else {
+            vec![]
+        };
+
+        // Get or create session KV cache; fall back to APC prefix cache when no session_id
         let session_cache = if let Some(ref sid) = session_id {
             let model_py_for_cache = Python::with_gil(|py| model_py.clone_ref(py));
             let (cache, offset) = self.get_or_create_session_cache(sid, model_py_for_cache).await;
             Some((cache, offset))
+        } else if !apc_prefix_msgs.is_empty() {
+            self.try_prefix_cache_hit(&apc_prefix_msgs).await
         } else {
             None
         };
+
+        // Clone refs for APC snapshot building (happens after generation, before they're dropped)
+        let (model_py_apc, tokenizer_py_apc) = if !apc_prefix_msgs.is_empty() && session_cache.is_none() {
+            (
+                Some(Python::with_gil(|py| model_py.clone_ref(py))),
+                Some(Python::with_gil(|py| tokenizer_py.clone_ref(py))),
+            )
+        } else {
+            (None, None)
+        };
+
         // Clone handles for use inside spawn_blocking; original retained for post-generation commit
         let session_cache_for_spawn: Option<(Py<PyAny>, usize)> = session_cache.as_ref()
             .map(|(cache, offset)| (Python::with_gil(|py| cache.clone_ref(py)), *offset));
+        // Clone chat_template_kwargs for APC use BEFORE it's moved into spawn_blocking
+        let chat_template_kwargs_apc = chat_template_kwargs.clone();
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
 
         let result = tokio::task::spawn_blocking(move || {
@@ -552,6 +699,13 @@ impl MlxService {
         // Update session KV cache (in-place mutation happened in Python)
         if let (Some(sid), Some((kv_cache, _))) = (session_id, session_cache) {
             self.commit_session(sid, kv_cache).await;
+        } else if let (Some(model_ref), Some(tok_ref)) = (model_py_apc, tokenizer_py_apc) {
+            // APC: build prefix snapshot in background so future requests benefit
+            let service = self.clone();
+            let prefix = apc_prefix_msgs;
+            tokio::spawn(async move {
+                service.build_and_store_prefix_snapshot(prefix, model_ref, tok_ref, chat_template_kwargs_apc).await;
+            });
         }
 
         Ok(result)
@@ -576,17 +730,39 @@ impl MlxService {
     ) -> Result<(ReceiverStream<Result<String, MlxError>>, Option<(String, Py<PyAny>, usize)>), MlxError> {
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
 
-        // Get or create session KV cache
+        // Extract prefix messages for APC before `messages` is moved into spawn_blocking
+        let apc_prefix_msgs = if self.config.enable_apc && session_id.is_none() {
+            extract_prefix_messages(&messages)
+        } else {
+            vec![]
+        };
+
+        // Get or create session KV cache; fall back to APC prefix cache when no session_id
         let session_cache = if let Some(ref sid) = session_id {
             let model_py_for_cache = Python::with_gil(|py| model_py.clone_ref(py));
             let (cache, offset) = self.get_or_create_session_cache(sid, model_py_for_cache).await;
             Some((cache, offset))
+        } else if !apc_prefix_msgs.is_empty() {
+            self.try_prefix_cache_hit(&apc_prefix_msgs).await
         } else {
             None
         };
+
+        // Clone refs for background APC snapshot building after generation starts
+        let (model_py_apc, tokenizer_py_apc) = if !apc_prefix_msgs.is_empty() && session_cache.is_none() {
+            (
+                Some(Python::with_gil(|py| model_py.clone_ref(py))),
+                Some(Python::with_gil(|py| tokenizer_py.clone_ref(py))),
+            )
+        } else {
+            (None, None)
+        };
+
         // Clone handles for use inside spawn_blocking; original retained for session_info return
         let session_cache_for_spawn: Option<(Py<PyAny>, usize)> = session_cache.as_ref()
             .map(|(cache, offset)| (Python::with_gil(|py| cache.clone_ref(py)), *offset));
+        // Clone chat_template_kwargs for APC use BEFORE it's moved into spawn_blocking
+        let chat_template_kwargs_apc = chat_template_kwargs.clone();
         let max_tokens = max_tokens.min(MAX_TOKEN_LIMIT).max(1);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, MlxError>>(64);
 
@@ -786,6 +962,16 @@ impl MlxService {
                 }
             });
         });
+
+        // Kick off background APC snapshot building (first request with this prefix pays a small
+        // background cost; subsequent requests get a free KV cache fast-path)
+        if let (Some(model_ref), Some(tok_ref)) = (model_py_apc, tokenizer_py_apc) {
+            let service = self.clone();
+            let prefix = apc_prefix_msgs;
+            tokio::spawn(async move {
+                service.build_and_store_prefix_snapshot(prefix, model_ref, tok_ref, chat_template_kwargs_apc).await;
+            });
+        }
 
         // Return stream + session info for the caller to commit after stream ends
         let session_info = session_id.zip(session_cache).map(|(sid, (cache, _))| (sid, cache, 0usize));
@@ -1581,4 +1767,56 @@ async fn fetch_model_size_gb(model_id: &str) -> Option<f64> {
     resp.get("usedStorage")
         .and_then(|v| v.as_f64())
         .map(|b| b / 1_073_741_824.0)
+}
+
+// ── APC helpers ──────────────────────────────────────────────────────────────
+
+fn unix_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Hash a slice of ChatMessages deterministically using role+content.
+fn hash_messages(msgs: &[ChatMessage]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for m in msgs {
+        m.role.hash(&mut h);
+        m.content.as_text().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Return all messages except the last user-role message.
+/// This represents the "stable prefix" that is typically shared across requests
+/// (e.g., the system prompt and any fixed few-shot examples).
+fn extract_prefix_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let last_user = messages.iter().rposition(|m| m.role == "user");
+    match last_user {
+        Some(idx) if idx > 0 => messages[..idx].to_vec(),
+        _ => vec![],
+    }
+}
+
+/// Format a partial message list as a prompt string WITHOUT the assistant generation
+/// prompt appended (i.e. add_generation_prompt=false). Used solely for token counting
+/// the prefix before building an APC snapshot.
+fn format_prefix_only(py: Python, tokenizer: &PyAny, messages: &[ChatMessage]) -> PyResult<String> {
+    let prepared = prepare_messages(messages);
+    let py_messages = PyList::new(py, prepared.iter().map(|m| {
+        let d = PyDict::new(py);
+        d.set_item("role", m.get("role").unwrap_or(&String::new())).unwrap();
+        d.set_item("content", m.get("content").unwrap_or(&String::new())).unwrap();
+        d
+    }));
+    let has_template = tokenizer.getattr("chat_template").map(|v| !v.is_none()).unwrap_or(false);
+    if has_template && tokenizer.hasattr("apply_chat_template")? {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("tokenize", false)?;
+        kwargs.set_item("add_generation_prompt", false)?;
+        tokenizer.call_method("apply_chat_template", (py_messages,), Some(kwargs))?.extract()
+    } else {
+        let lines: Vec<String> = prepared.iter().map(|m| {
+            format!("{}: {}", m.get("role").unwrap_or(&String::new()), m.get("content").unwrap_or(&String::new()))
+        }).collect();
+        Ok(lines.join("\n"))
+    }
 }

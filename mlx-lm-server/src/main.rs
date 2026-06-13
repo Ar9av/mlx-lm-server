@@ -118,6 +118,8 @@ async fn main() {
         .route("/api/models/local/:org/*model", delete(routes::models::delete_local_model))
         .route("/api/huggingface/models", get(routes::models::search_hf_models))
         .route("/api/ps", get(routes::models::ps))
+        // Automatic Prefix Cache (APC)
+        .route("/v1/prefix_cache", get(routes::prefix_cache::get_prefix_cache_stats).delete(routes::prefix_cache::clear_prefix_cache))
         // Prompt cache sessions
         .route("/v1/sessions/:session_id", delete(routes::chat::delete_session))
         // Benchmarking
