@@ -404,7 +404,12 @@ impl MlxService {
                     cache.insert(hash, PrefixEntry { snapshot, token_count, last_hit: unix_secs(), hits: 0 });
                     info!("APC: stored prefix snapshot ({} tokens, {} entries)", token_count, cache.len());
                 }
-                Err(e) => warn!("APC: failed to build prefix snapshot: {}", e),
+                Err(e) => {
+                    let tb = Python::with_gil(|py| {
+                        e.traceback(py).and_then(|t| t.format().ok()).unwrap_or_default()
+                    });
+                    warn!("APC: failed to build prefix snapshot: {}\n{}", e, tb);
+                }
             }
         });
     }
@@ -534,6 +539,82 @@ impl MlxService {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    // ── KV cache persistence ──────────────────────────────────────────────────
+
+    /// Serialize all prefix cache entries to `path` using Python pickle.
+    /// Returns the number of entries written.
+    pub async fn save_prefix_cache_to_file(&self, path: String) -> Result<usize, MlxError> {
+        let entries: Vec<(u64, Py<PyAny>, usize, u64, u64)> = {
+            let cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.iter().map(|(k, e)| {
+                let snap = Python::with_gil(|py| e.snapshot.clone_ref(py));
+                (*k, snap, e.token_count, e.last_hit, e.hits)
+            }).collect()
+        };
+        let n = entries.len();
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<()> {
+                // Build list of (key, snapshot, token_count, last_hit, hits)
+                let py_list = pyo3::types::PyList::empty(py);
+                for (key, snap, tc, lh, hits) in &entries {
+                    let tup = pyo3::types::PyTuple::new(py, &[
+                        key.into_py(py),
+                        snap.clone_ref(py).into_py(py),
+                        tc.into_py(py),
+                        lh.into_py(py),
+                        hits.into_py(py),
+                    ]);
+                    py_list.append(tup)?;
+                }
+                let pickle = py.import("pickle")?;
+                let data = pickle.call_method1("dumps", (py_list,))?;
+                let builtins = py.import("builtins")?;
+                let f = builtins.call_method1("open", (&path, "wb"))?;
+                f.call_method1("write", (data,))?;
+                f.call_method0("close")?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// Restore prefix cache entries from a pickle file created by `save_prefix_cache_to_file`.
+    /// Returns the number of entries loaded.
+    pub async fn load_prefix_cache_from_file(&self, path: String) -> Result<usize, MlxError> {
+        let cache_ref = self.prefix_cache.clone();
+        let max_entries = self.config.apc_max_entries;
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<usize> {
+                let pickle = py.import("pickle")?;
+                let builtins = py.import("builtins")?;
+                let f = builtins.call_method1("open", (&path, "rb"))?;
+                let data = f.call_method0("read")?;
+                f.call_method0("close")?;
+                let py_list: &pyo3::types::PyList = pickle.call_method1("loads", (data,))?.downcast()?;
+                let mut cache = cache_ref.lock().unwrap_or_else(|e| e.into_inner());
+                let mut loaded = 0usize;
+                for item in py_list.iter() {
+                    if cache.len() >= max_entries { break; }
+                    let tup: &pyo3::types::PyTuple = item.downcast()?;
+                    let key: u64 = tup.get_item(0)?.extract()?;
+                    let snap: PyObject = tup.get_item(1)?.into_py(py);
+                    let tc: usize = tup.get_item(2)?.extract()?;
+                    let lh: u64 = tup.get_item(3)?.extract()?;
+                    let hits: u64 = tup.get_item(4)?.extract()?;
+                    cache.insert(key, PrefixEntry { snapshot: snap, token_count: tc, last_hit: lh, hits });
+                    loaded += 1;
+                }
+                Ok(loaded)
+            })
+        })
+        .await
+        .map_err(|e| MlxError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| MlxError::Python(e.to_string()))
     }
 
     pub async fn get_embeddings(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, MlxError> {
@@ -2084,11 +2165,15 @@ fn extract_prefix_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 /// prompt appended (i.e. add_generation_prompt=false). Used solely for token counting
 /// the prefix before building an APC snapshot.
 fn format_prefix_only(py: Python, tokenizer: &PyAny, messages: &[ChatMessage]) -> PyResult<String> {
-    let prepared = prepare_messages(messages);
-    let py_messages = PyList::new(py, prepared.iter().map(|m| {
+    if messages.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err("empty prefix messages"));
+    }
+    // Pass messages directly with their original roles — do NOT use prepare_messages, which
+    // silently drops system-only lists (it merges system content into the first user turn).
+    let py_messages = PyList::new(py, messages.iter().map(|m| {
         let d = PyDict::new(py);
-        d.set_item("role", m.get("role").unwrap_or(&String::new())).unwrap();
-        d.set_item("content", m.get("content").unwrap_or(&String::new())).unwrap();
+        d.set_item("role", &m.role).unwrap();
+        d.set_item("content", m.content.as_text()).unwrap();
         d
     }));
     let has_template = tokenizer.getattr("chat_template").map(|v| !v.is_none()).unwrap_or(false);
@@ -2098,8 +2183,8 @@ fn format_prefix_only(py: Python, tokenizer: &PyAny, messages: &[ChatMessage]) -
         kwargs.set_item("add_generation_prompt", false)?;
         tokenizer.call_method("apply_chat_template", (py_messages,), Some(kwargs))?.extract()
     } else {
-        let lines: Vec<String> = prepared.iter().map(|m| {
-            format!("{}: {}", m.get("role").unwrap_or(&String::new()), m.get("content").unwrap_or(&String::new()))
+        let lines: Vec<String> = messages.iter().map(|m| {
+            format!("{}: {}", m.role, m.content.as_text())
         }).collect();
         Ok(lines.join("\n"))
     }
