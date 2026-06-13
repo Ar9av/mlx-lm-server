@@ -120,6 +120,11 @@ pub async fn chat_completions(
         }),
         logit_bias: req.logit_bias.clone(),
         grammar: req.grammar.clone(),
+        mirostat: req.mirostat,
+        mirostat_tau: req.mirostat_tau,
+        mirostat_eta: req.mirostat_eta,
+        dynatemp_range: req.dynatemp_range,
+        dynatemp_exponent: req.dynatemp_exponent,
     };
     let chat_template_kwargs = req.chat_template_kwargs.clone();
     let kv_bits = req.kv_bits;

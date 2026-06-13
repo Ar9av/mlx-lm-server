@@ -125,6 +125,11 @@ pub async fn create_batch(
                 thinking_budget: chat_req.thinking_budget,
                 logit_bias: chat_req.logit_bias.clone(),
                 grammar: chat_req.grammar.clone(),
+                mirostat: chat_req.mirostat,
+                mirostat_tau: chat_req.mirostat_tau,
+                mirostat_eta: chat_req.mirostat_eta,
+                dynatemp_range: chat_req.dynatemp_range,
+                dynatemp_exponent: chat_req.dynatemp_exponent,
             };
             let chat_template_kwargs = chat_req.chat_template_kwargs.clone();
             let kv_bits = chat_req.kv_bits;

@@ -1473,6 +1473,22 @@ fn apply_chat_template(
 }
 
 fn make_sampler<'py>(py: Python<'py>, p: &SamplerParams) -> PyResult<&'py PyAny> {
+    // Mirostat v2 — replaces the default sampler entirely
+    if p.mirostat == Some(true) {
+        let tau = p.mirostat_tau.unwrap_or(5.0);
+        let eta = p.mirostat_eta.unwrap_or(0.1);
+        let temp = p.temperature;
+        return make_mirostat_sampler(py, tau, eta, temp);
+    }
+    // Dynamic temperature — wraps the base sampler
+    if let Some(dynatemp_range) = p.dynatemp_range {
+        if dynatemp_range > 0.0 {
+            let exponent = p.dynatemp_exponent.unwrap_or(1.0);
+            let temp = p.temperature;
+            return make_dynatemp_sampler(py, temp, dynatemp_range, exponent);
+        }
+    }
+    // Default mlx-lm sampler
     let kwargs = PyDict::new(py);
     kwargs.set_item("temp", p.temperature)?;
     kwargs.set_item("top_p", p.top_p)?;
@@ -1484,6 +1500,108 @@ fn make_sampler<'py>(py: Python<'py>, p: &SamplerParams) -> PyResult<&'py PyAny>
     py.import("mlx_lm.sample_utils")?
         .getattr("make_sampler")?
         .call((), Some(kwargs))
+}
+
+fn make_mirostat_sampler<'py>(py: Python<'py>, tau: f64, eta: f64, temp: f64) -> PyResult<&'py PyAny> {
+    let code = r#"
+import mlx.core as _mx
+import math as _math
+import random as _random
+
+class _MirostatV2Sampler:
+    """Mirostat v2: adapts temperature per step to target perplexity tau."""
+    def __init__(self, tau, eta, temp):
+        self.tau = tau
+        self.eta = eta
+        self.temp = temp
+        self.mu = 2.0 * tau  # running surprise estimate
+
+    def __call__(self, logits):
+        if self.temp > 0:
+            logits = logits / self.temp
+        # Work on top-2000 tokens to avoid full 128K vocab iteration
+        k = min(2000, int(logits.shape[-1]))
+        top_idx = _mx.argpartition(-logits, k)[:k].tolist()
+        top_logits = logits[top_idx].tolist()
+        max_l = max(top_logits)
+        exps = [_math.exp(l - max_l) for l in top_logits]
+        total = sum(exps)
+        probs = [e / total for e in exps]
+        pairs = sorted(zip(top_idx, probs), key=lambda x: -x[1])
+        # Mirostat truncation: drop tokens whose surprise exceeds mu
+        kept = []
+        for tok_id, p in pairs:
+            if p <= 0:
+                continue
+            if -_math.log2(p) > self.mu and len(kept) > 0:
+                break
+            kept.append((tok_id, p))
+        if not kept:
+            kept = pairs[:1]
+        # Normalize and sample
+        kt = sum(p for _, p in kept)
+        r = _random.random() * kt
+        cum = 0.0
+        selected, sel_p = kept[0]
+        for tok_id, p in kept:
+            cum += p
+            if r <= cum:
+                selected, sel_p = tok_id, p
+                break
+        # Update mu
+        surprise = -_math.log2(max(sel_p, 1e-10))
+        self.mu = self.mu - self.eta * (surprise - self.tau)
+        return _mx.array(int(selected))
+
+_mirostat_sampler = _MirostatV2Sampler(_tau, _eta, _temp)
+"#;
+    let locals = PyDict::new(py);
+    locals.set_item("_tau", tau)?;
+    locals.set_item("_eta", eta)?;
+    locals.set_item("_temp", temp)?;
+    py.run(code, None, Some(locals))?;
+    Ok(locals.get_item("_mirostat_sampler")
+        .and_then(|o| o.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("mirostat sampler not found")))?)
+}
+
+fn make_dynatemp_sampler<'py>(py: Python<'py>, temp: f64, range: f64, exponent: f64) -> PyResult<&'py PyAny> {
+    let code = r#"
+import mlx.core as _mx
+import math as _math
+
+class _DynaTempSampler:
+    """Dynamic temperature: scales temperature by normalised entropy of the logit distribution."""
+    def __init__(self, temp, dynatemp_range, dynatemp_exponent):
+        self.temp = temp
+        self.range = dynatemp_range
+        self.exp = dynatemp_exponent
+
+    def __call__(self, logits):
+        # Compute entropy over top-1000 tokens for speed
+        k = min(1000, int(logits.shape[-1]))
+        top_idx = _mx.argpartition(-logits, k)[:k].tolist()
+        top_l = logits[top_idx].tolist()
+        max_l = max(top_l)
+        exps = [_math.exp(l - max_l) for l in top_l]
+        total = sum(exps)
+        probs = [e / total for e in exps]
+        entropy = -sum(p * _math.log(max(p, 1e-10)) for p in probs)
+        max_entropy = _math.log(k)
+        norm_entropy = entropy / max(max_entropy, 1e-10)
+        # Scale temperature: high entropy → higher temp, low entropy → lower temp
+        scale = 1.0 + self.range * (norm_entropy ** self.exp - 0.5)
+        t = max(0.01, self.temp * scale)
+        return _mx.random.categorical(logits / t)
+
+_dynatemp_sampler = _DynaTempSampler(_temp, _range, _exp)
+"#;
+    let locals = PyDict::new(py);
+    locals.set_item("_temp", temp)?;
+    locals.set_item("_range", range)?;
+    locals.set_item("_exp", exponent)?;
+    py.run(code, None, Some(locals))?;
+    Ok(locals.get_item("_dynatemp_sampler")
+        .and_then(|o| o.ok_or_else(|| pyo3::exceptions::PyValueError::new_err("dynatemp sampler not found")))?)
 }
 
 /// Walk model layers and reduce top_k on MoE router layers.
