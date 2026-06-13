@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -65,6 +65,8 @@ pub struct MlxService {
     pub last_used_at: Arc<AtomicU64>,
     /// How long to keep the model after the last request (-1 = never, 0 = immediately).
     pub keep_alive_secs: Arc<AtomicI64>,
+    /// Per-request cancellation flags keyed by request/chat ID.
+    pub active_requests: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl MlxService {
@@ -75,7 +77,26 @@ impl MlxService {
             prefix_cache: Arc::new(StdMutex::new(HashMap::new())),
             last_used_at: Arc::new(AtomicU64::new(0)),
             keep_alive_secs: Arc::new(AtomicI64::new(default_ka)),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
             config,
+        }
+    }
+
+    /// Register a cancellable streaming request; returns the flag to pass into the generation loop.
+    pub fn register_cancel(&self, request_id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.active_requests.lock().unwrap_or_else(|e| e.into_inner()).insert(request_id.to_string(), Arc::clone(&flag));
+        flag
+    }
+
+    /// Signal a running stream to stop. Returns true if the request was found.
+    pub fn cancel_request(&self, request_id: &str) -> bool {
+        let guard = self.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(flag) = guard.get(request_id) {
+            flag.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 
@@ -944,6 +965,7 @@ impl MlxService {
 
     pub async fn generate_stream(
         &self,
+        request_id: String,
         messages: Vec<ChatMessage>,
         max_tokens: usize,
         sampler: SamplerParams,
@@ -959,6 +981,8 @@ impl MlxService {
         seed: Option<u64>,
         session_id: Option<String>,
     ) -> Result<(ReceiverStream<Result<String, MlxError>>, Option<(String, Py<PyAny>, usize)>), MlxError> {
+        let cancel_flag = self.register_cancel(&request_id);
+        let active_requests_ref = Arc::clone(&self.active_requests);
         let (model_py, tokenizer_py, draft_model_py) = self.get_model_refs_for(adapter_name.as_deref()).await?;
 
         // Extract prefix messages for APC before `messages` is moved into spawn_blocking
@@ -1001,6 +1025,7 @@ impl MlxService {
             Python::with_gil(|py| {
                 let run = || -> PyResult<()> {
                     // Ensure Metal stream is initialized on this thread before any GPU ops
+                    // (cancel_flag and active_requests_ref are used below in the gen loop)
                     let _ = py.import("mlx.core").and_then(|mx| mx.call_method0("synchronize"));
                     let tokenizer = tokenizer_py.as_ref(py);
                     let windowed = apply_sliding_window(messages, MAX_WINDOW_TOKENS, py, tokenizer);
@@ -1089,6 +1114,10 @@ impl MlxService {
                         if start.elapsed().as_secs_f64() > timeout_secs {
                             warn!("Stream timeout exceeded");
                             let _ = tx.blocking_send(Err(MlxError::Timeout));
+                            return Ok(());
+                        }
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            let _ = tx.blocking_send(Ok("\x00FINISH:cancelled\x00".to_string()));
                             return Ok(());
                         }
                         let response = item?;
@@ -1191,6 +1220,8 @@ impl MlxService {
                     error!("Streaming Python error: {}", e);
                     let _ = tx.blocking_send(Err(MlxError::Python(e.to_string())));
                 }
+                // Deregister cancel flag — request is done (normally or via cancel/error).
+                active_requests_ref.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
             });
         });
 

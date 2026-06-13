@@ -335,7 +335,7 @@ async fn stream_response(
     let timeout = state.config.stream_timeout;
 
     let (token_stream, session_info) = match state.mlx.generate_stream(
-        messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id,
+        chat_id.clone(), messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id,
     ).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),

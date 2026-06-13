@@ -2,6 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use std::time::Instant;
 use tracing::info;
 
+use crate::mlx_service::MlxService;
 use crate::models::{BenchmarkRequest, BenchmarkResult, ChatMessage, MessageContent, SamplerParams};
 use crate::state::AppState;
 
@@ -50,7 +51,9 @@ pub async fn run_benchmark(
         };
 
         let run_start = Instant::now();
+        let bench_id = MlxService::new_chat_id();
         match state.mlx.generate_stream(
+            bench_id,
             messages.clone(),
             max_tokens,
             sampler.clone(),

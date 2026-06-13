@@ -92,6 +92,7 @@ async fn main() {
         // OpenAI-compatible
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
+        .route("/v1/completions/:request_id", delete(routes::completions::cancel_completion))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
         .route("/v1/tokenize", post(routes::chat::tokenize))
         .route("/infill", post(routes::infill::infill))
