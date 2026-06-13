@@ -13,7 +13,7 @@ use tokio::fs;
 use tracing::warn;
 
 use crate::mlx_service::process_rss_mb;
-use crate::models::{HfModel, LocalModel, ModelInfo, ModelList, ModelLoadRequest, ModelObject, PsResponse, QuantizationInfo};
+use crate::models::{HfModel, LoadedModelEntry, LoadedModelsResponse, LocalModel, ModelInfo, ModelList, ModelLoadRequest, ModelObject, PsResponse, QuantizationInfo};
 use crate::state::AppState;
 
 // ── /v1/models — returns all locally cached models (loaded model marked) ─────
@@ -80,6 +80,22 @@ pub async fn ps(State(state): State<AppState>) -> Json<PsResponse> {
         memory_mb: process_rss_mb(),
         pid: std::process::id(),
     })
+}
+
+// ── /v1/models/loaded — loaded models with TTL info ─────────────────────────
+
+pub async fn list_loaded_models(State(state): State<AppState>) -> Json<LoadedModelsResponse> {
+    let entries = match state.mlx.loaded_model_ttl_info().await {
+        Some((id, loaded_at, last_used_at, keep_alive_secs, expires_at)) => vec![LoadedModelEntry {
+            id,
+            loaded_at,
+            last_used_at,
+            keep_alive_secs,
+            expires_at,
+        }],
+        None => vec![],
+    };
+    Json(LoadedModelsResponse { models: entries })
 }
 
 // ── /v1/models/{id}/info — rich model metadata ───────────────────────────────

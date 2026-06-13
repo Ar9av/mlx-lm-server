@@ -30,6 +30,10 @@ pub struct Config {
     pub enable_apc: bool,
     /// Maximum number of prefix snapshots to keep (LRU eviction when exceeded).
     pub apc_max_entries: usize,
+    /// How many seconds to keep the model loaded after the last request (default 300).
+    /// Requests can override per-call with the `keep_alive` field.
+    /// Set to 0 to unload immediately; set to u64::MAX to never auto-unload.
+    pub default_keep_alive_secs: u64,
 }
 
 impl Config {
@@ -60,6 +64,7 @@ impl Config {
             keepalive_secs: env_usize("MLX_KEEPALIVE_SECS", 15) as u64,
             enable_apc: env_bool("MLX_ENABLE_APC", true),
             apc_max_entries: env_usize("MLX_APC_MAX_ENTRIES", 32),
+            default_keep_alive_secs: env_usize("MLX_KEEP_ALIVE_SECS", 300) as u64,
         }
     }
 }

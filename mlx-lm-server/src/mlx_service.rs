@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -60,15 +61,49 @@ pub struct MlxService {
     /// Prefix cache uses std::sync::Mutex so spawn_blocking closures can write to it directly.
     pub prefix_cache: Arc<StdMutex<HashMap<u64, PrefixEntry>>>,
     config: Arc<Config>,
+    /// Unix seconds of the last completed inference request (0 = never used).
+    pub last_used_at: Arc<AtomicU64>,
+    /// How long to keep the model after the last request (-1 = never, 0 = immediately).
+    pub keep_alive_secs: Arc<AtomicI64>,
 }
 
 impl MlxService {
     pub fn new(config: Arc<Config>) -> Self {
+        let default_ka = config.default_keep_alive_secs as i64;
         Self {
             inner: Arc::new(Mutex::new(Inner { loaded: None, adapters: HashMap::new(), prompt_sessions: HashMap::new() })),
             prefix_cache: Arc::new(StdMutex::new(HashMap::new())),
+            last_used_at: Arc::new(AtomicU64::new(0)),
+            keep_alive_secs: Arc::new(AtomicI64::new(default_ka)),
             config,
         }
+    }
+
+    /// Record a completed inference and optionally override the keep_alive TTL.
+    /// `keep_alive`: None = keep existing TTL, Some(-1) = never unload, Some(0) = unload now,
+    /// Some(n) = TTL in seconds.
+    pub fn touch_keep_alive(&self, keep_alive: Option<i64>) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        self.last_used_at.store(now, Ordering::Relaxed);
+        if let Some(ka) = keep_alive {
+            self.keep_alive_secs.store(ka, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns (model_id, loaded_at_unix, last_used_at, keep_alive_secs, expires_at)
+    pub async fn loaded_model_ttl_info(&self) -> Option<(String, u64, u64, i64, Option<u64>)> {
+        let guard = self.inner.lock().await;
+        guard.loaded.as_ref().map(|l| {
+            let last_used = self.last_used_at.load(Ordering::Relaxed);
+            let ka = self.keep_alive_secs.load(Ordering::Relaxed);
+            let expires_at = if ka < 0 {
+                None
+            } else {
+                let base = if last_used == 0 { l.loaded_at_unix } else { last_used };
+                Some(base + ka as u64)
+            };
+            (l.model_id.clone(), l.loaded_at_unix, last_used, ka, expires_at)
+        })
     }
 
     pub async fn current_model(&self) -> Option<String> {

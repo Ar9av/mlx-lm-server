@@ -210,6 +210,10 @@ pub struct ChatCompletionRequest {
     pub mirostat_eta: Option<f64>,
     pub dynatemp_range: Option<f64>,
     pub dynatemp_exponent: Option<f64>,
+    /// Seconds to keep the model loaded after this request completes.
+    /// -1 = never auto-unload, 0 = unload immediately, positive = TTL in seconds.
+    /// Overrides the server default (MLX_KEEP_ALIVE_SECS, default 300).
+    pub keep_alive: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -419,6 +423,7 @@ pub struct CompletionRequest {
     pub n: Option<u32>,
     pub kv_bits: Option<u32>,
     pub kv_group_size: Option<u32>,
+    pub keep_alive: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -685,6 +690,22 @@ pub struct PsResponse {
     pub loaded_at: Option<u64>,
     pub memory_mb: f64,
     pub pid: u32,
+}
+
+// ── Loaded models TTL ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct LoadedModelEntry {
+    pub id: String,
+    pub loaded_at: u64,
+    pub last_used_at: u64,
+    pub keep_alive_secs: i64,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoadedModelsResponse {
+    pub models: Vec<LoadedModelEntry>,
 }
 
 // ── Local model cache ─────────────────────────────────────────────────────────

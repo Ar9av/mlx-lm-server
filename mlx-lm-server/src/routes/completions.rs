@@ -34,6 +34,7 @@ pub async fn completions(
 
     info!("Completion request for model {}", model_name);
 
+    let keep_alive = req.keep_alive;
     match state.mlx.generate_completion(
         req.prompt.first().to_string(),
         max_tokens,
@@ -43,6 +44,7 @@ pub async fn completions(
         None,
     ).await {
         Ok((text, prompt_tokens, completion_tokens)) => {
+            state.mlx.touch_keep_alive(keep_alive);
             let resp = CompletionResponse::new(
                 MlxService::new_chat_id(),
                 model_name,
