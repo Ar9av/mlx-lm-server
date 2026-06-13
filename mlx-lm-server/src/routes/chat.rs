@@ -181,54 +181,114 @@ async fn sync_response(
     let mut total_prompt = 0usize;
     let mut total_completion = 0usize;
 
+    // Extract JSON schema for post-generation validation
+    let json_validation_schema = req.response_format.as_ref().and_then(|rf| match rf.kind.as_str() {
+        "json_schema" => rf.json_schema.as_ref().and_then(|s| s.get("schema")).cloned(),
+        "json_object" => Some(serde_json::Value::Null), // only check parseability
+        _ => None,
+    });
+    let validate_json = json_validation_schema.is_some();
+    const MAX_JSON_RETRIES: usize = 3;
+
     for i in 0..n {
         let run_seed = seed.map(|s| s.wrapping_add(i as u64));
-        match state.mlx.generate_response(
-            messages.clone(), max_tokens, sampler.clone(), chat_template_kwargs.clone(),
-            kv_bits, kv_group_size, adapter_name.clone(),
-            tools.clone(), stop_strings.clone(),
-            want_logprobs, top_n_logprobs,
-            run_seed,
-            if i == 0 { session_id.clone() } else { None },
-        ).await {
-            Ok((content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list, reasoning)) => {
-                metrics::add_tokens(prompt_tokens, completion_tokens);
-                total_prompt += prompt_tokens;
-                total_completion += completion_tokens;
+        let mut gen_result = None;
 
-                let message = if !tool_calls.is_empty() {
-                    crate::models::ChatMessage { role: "assistant".into(), content: crate::models::MessageContent::Text(String::new()) }
-                } else {
-                    crate::models::ChatMessage { role: "assistant".into(), content: crate::models::MessageContent::Text(content) }
-                };
+        for attempt in 0..if validate_json { MAX_JSON_RETRIES } else { 1 } {
+            let result = state.mlx.generate_response(
+                messages.clone(), max_tokens, sampler.clone(), chat_template_kwargs.clone(),
+                kv_bits, kv_group_size, adapter_name.clone(),
+                tools.clone(), stop_strings.clone(),
+                want_logprobs, top_n_logprobs,
+                run_seed,
+                if i == 0 { session_id.clone() } else { None },
+            ).await;
 
-                let logprobs = lp_list.map(|lps| LogprobsInfo {
-                    content: lps.into_iter().map(|v| TokenLogprob {
-                        token: v["token"].as_str().unwrap_or("").to_string(),
-                        logprob: v["logprob"].as_f64().unwrap_or(0.0) as f32,
-                        bytes: None,
-                        top_logprobs: v["top_logprobs"].as_array().unwrap_or(&vec![]).iter().map(|t| TopLogprob {
-                            token: t["token"].as_str().unwrap_or("").to_string(),
-                            logprob: t["logprob"].as_f64().unwrap_or(0.0) as f32,
-                            bytes: None,
-                        }).collect(),
-                    }).collect(),
-                });
+            match result {
+                Err(e) => {
+                    error!("Generation run {} attempt {} failed: {}", i, attempt, e);
+                    return e.into_response();
+                }
+                Ok(tuple) => {
+                    let json_ok = if validate_json && tuple.3.is_empty() {
+                        match state.mlx.validate_json_schema(
+                            tuple.0.clone(),
+                            json_validation_schema.clone(),
+                        ).await {
+                            Ok(()) => true,
+                            Err(err) if attempt + 1 < MAX_JSON_RETRIES => {
+                                info!("JSON validation failed attempt {} (retrying): {}", attempt, err);
+                                false
+                            }
+                            Err(err) => {
+                                info!("JSON validation failed on final attempt, using output anyway: {}", err);
+                                true
+                            }
+                        }
+                    } else {
+                        true
+                    };
 
-                choices.push(crate::models::ChatCompletionChoice {
-                    index: i,
-                    message,
-                    finish_reason: Some(finish_reason),
-                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
-                    logprobs,
-                    reasoning_content: reasoning,
-                });
-            }
-            Err(e) => {
-                error!("Generation run {} failed: {}", i, e);
-                return e.into_response();
+                    if json_ok {
+                        gen_result = Some(tuple);
+                        break;
+                    }
+                }
             }
         }
+
+        let (mut content, prompt_tokens, completion_tokens, tool_calls, finish_reason, lp_list, reasoning) =
+            gen_result.expect("generation loop must yield a result");
+
+        // For JSON output modes, strip model artifacts (code fences, EOS tokens)
+        if validate_json && tool_calls.is_empty() {
+            let s = content
+                .replace("<|im_end|>", "")
+                .replace("<|endoftext|>", "")
+                .replace("<|end|>", "")
+                .replace("</s>", "");
+            let trimmed = s.trim();
+            let inner = if let Some(r) = trimmed.strip_prefix("```json") {
+                r.trim_end_matches('`').trim()
+            } else if let Some(r) = trimmed.strip_prefix("```") {
+                r.trim_end_matches('`').trim()
+            } else {
+                trimmed
+            };
+            content = inner.to_string();
+        }
+
+        metrics::add_tokens(prompt_tokens, completion_tokens);
+        total_prompt += prompt_tokens;
+        total_completion += completion_tokens;
+
+        let message = if !tool_calls.is_empty() {
+            crate::models::ChatMessage { role: "assistant".into(), content: crate::models::MessageContent::Text(String::new()) }
+        } else {
+            crate::models::ChatMessage { role: "assistant".into(), content: crate::models::MessageContent::Text(content) }
+        };
+
+        let logprobs = lp_list.map(|lps| LogprobsInfo {
+            content: lps.into_iter().map(|v| TokenLogprob {
+                token: v["token"].as_str().unwrap_or("").to_string(),
+                logprob: v["logprob"].as_f64().unwrap_or(0.0) as f32,
+                bytes: None,
+                top_logprobs: v["top_logprobs"].as_array().unwrap_or(&vec![]).iter().map(|t| TopLogprob {
+                    token: t["token"].as_str().unwrap_or("").to_string(),
+                    logprob: t["logprob"].as_f64().unwrap_or(0.0) as f32,
+                    bytes: None,
+                }).collect(),
+            }).collect(),
+        });
+
+        choices.push(crate::models::ChatCompletionChoice {
+            index: i,
+            message,
+            finish_reason: Some(finish_reason),
+            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            logprobs,
+            reasoning_content: reasoning,
+        });
     }
 
     let usage = Usage { prompt_tokens: total_prompt, completion_tokens: total_completion, total_tokens: total_prompt + total_completion };
