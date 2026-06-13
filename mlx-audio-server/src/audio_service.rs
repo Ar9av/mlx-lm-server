@@ -29,10 +29,17 @@ struct LoadedSts {
     loaded_at_unix: u64,
 }
 
+struct LoadedVad {
+    model: Py<PyAny>,
+    model_id: String,
+    loaded_at_unix: u64,
+}
+
 struct Inner {
     tts: Option<LoadedTts>,
     stt: Option<LoadedStt>,
     sts: Option<LoadedSts>,
+    vad: Option<LoadedVad>,
 }
 
 #[derive(Clone)]
@@ -44,7 +51,7 @@ pub struct AudioService {
 impl AudioService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner { tts: None, stt: None, sts: None })),
+            inner: Arc::new(Mutex::new(Inner { tts: None, stt: None, sts: None, vad: None })),
             config,
         }
     }
@@ -146,6 +153,90 @@ impl AudioService {
     pub async fn unload_tts(&self) { self.inner.lock().await.tts = None; }
     pub async fn unload_stt(&self) { self.inner.lock().await.stt = None; }
     pub async fn unload_sts(&self) { self.inner.lock().await.sts = None; }
+    pub async fn unload_vad(&self) { self.inner.lock().await.vad = None; }
+    pub async fn vad_model_id(&self) -> Option<String> {
+        self.inner.lock().await.vad.as_ref().map(|v| v.model_id.clone())
+    }
+
+    pub async fn load_vad(&self, model_id: String) -> Result<(), AudioError> {
+        info!("Loading VAD model: {}", model_id);
+        let mid = model_id.clone();
+        let model_py = tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<PyObject> {
+                let vad_mod = py.import("mlx_audio.vad")?;
+                let model = vad_mod.getattr("load")?.call1((&mid,))?;
+                Ok(model.into())
+            })
+        })
+        .await
+        .map_err(|e| AudioError::LoadFailed(e.to_string()))?
+        .map_err(|e: PyErr| AudioError::LoadFailed(e.to_string()))?;
+
+        self.inner.lock().await.vad = Some(LoadedVad { model: model_py, model_id, loaded_at_unix: unix_now() });
+        info!("VAD model loaded");
+        Ok(())
+    }
+
+    /// Detect speech segments in an audio file.
+    /// Returns a list of (start_secs, end_secs) tuples and the total audio duration in seconds.
+    pub async fn detect_speech_segments(
+        &self,
+        audio_path: String,
+        threshold: Option<f64>,
+        min_speech_ms: Option<u64>,
+        min_silence_ms: Option<u64>,
+        speech_pad_ms: Option<u64>,
+        return_seconds: bool,
+    ) -> Result<(Vec<(f64, f64)>, f64), AudioError> {
+        let guard = self.inner.lock().await;
+        let vad = guard.vad.as_ref().ok_or_else(|| AudioError::Internal("VAD model not loaded".into()))?;
+        let model_py = Python::with_gil(|py| vad.model.clone_ref(py));
+        drop(guard);
+
+        tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| -> PyResult<(Vec<(f64, f64)>, f64)> {
+                let model = model_py.as_ref(py);
+                let kwargs = PyDict::new(py);
+                if let Some(t) = threshold { kwargs.set_item("threshold", t)?; }
+                if let Some(ms) = min_speech_ms { kwargs.set_item("min_speech_duration_ms", ms)?; }
+                if let Some(ms) = min_silence_ms { kwargs.set_item("min_silence_duration_ms", ms)?; }
+                if let Some(ms) = speech_pad_ms { kwargs.set_item("speech_pad_ms", ms)?; }
+                kwargs.set_item("return_seconds", return_seconds)?;
+
+                let output = model.call_method("generate", (&audio_path,), Some(kwargs))?;
+
+                // Read timestamps list from VADOutput.timestamps
+                let ts_list = output.getattr("timestamps")?;
+                let length = ts_list.len().unwrap_or(0);
+                let mut segments: Vec<(f64, f64)> = Vec::new();
+                for i in 0..length {
+                    let item: &pyo3::PyAny = ts_list.get_item(i)?;
+                    let start: f64 = item.get_item("start")
+                        .or_else(|_| item.getattr("start"))
+                        .and_then(|v: &pyo3::PyAny| v.extract::<f64>())?;
+                    let end: f64 = item.get_item("end")
+                        .or_else(|_| item.getattr("end"))
+                        .and_then(|v: &pyo3::PyAny| v.extract::<f64>())?;
+                    segments.push((start, end));
+                }
+
+                // Compute duration via soundfile or fall back to last segment end
+                let duration = py.import("soundfile")
+                    .and_then(|sf| {
+                        let info = sf.getattr("info")?.call1((&audio_path,))?;
+                        info.getattr("duration")?.extract::<f64>()
+                    })
+                    .unwrap_or_else(|_| {
+                        segments.last().map(|(_, e)| *e).unwrap_or(0.0)
+                    });
+
+                Ok((segments, duration))
+            })
+        })
+        .await
+        .map_err(|e| AudioError::Internal(e.to_string()))?
+        .map_err(|e: PyErr| AudioError::Internal(e.to_string()))
+    }
 
     // ── TTS synthesis ─────────────────────────────────────────────────────────
 

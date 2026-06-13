@@ -49,6 +49,8 @@ async fn main() {
         .route("/v1/audio/translations", post(routes::translations::create_translation))
         // STS — source separation
         .route("/v1/audio/separations", post(routes::separations::create_separation))
+        // VAD — voice activity detection
+        .route("/v1/audio/vad", post(routes::vad::detect_voice_activity))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state);
