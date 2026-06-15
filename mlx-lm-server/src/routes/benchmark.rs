@@ -37,10 +37,8 @@ pub async fn run_benchmark(
     let mut tps_list: Vec<f64> = Vec::new();
     let mut total_tokens = 0usize;
 
-    let sem = state.inference_sem.clone();
-
     for i in 0..runs {
-        let _permit = match sem.clone().acquire_owned().await {
+        let _permit = match state.acquire_inference_slot().await {
             Ok(p) => p,
             Err(_) => {
                 return (

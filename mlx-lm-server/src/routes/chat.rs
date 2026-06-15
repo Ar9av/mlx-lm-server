@@ -45,7 +45,7 @@ pub async fn chat_completions(
         let max_tokens = req.max_tokens.unwrap_or(state.config.default_max_tokens);
         let temperature = req.temperature.unwrap_or(state.config.default_temperature);
         let top_p = req.top_p.unwrap_or(state.config.default_top_p);
-        let _permit = match state.inference_sem.clone().acquire_owned().await {
+        let _permit = match state.acquire_inference_slot().await {
             Ok(p) => p,
             Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),
@@ -143,7 +143,7 @@ pub async fn chat_completions(
     let seed = req.seed;
     let session_id = req.session_id.clone();
 
-    let permit = match state.inference_sem.clone().acquire_owned().await {
+    let permit = match state.acquire_inference_slot().await {
         Ok(p) => p,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),

@@ -67,6 +67,8 @@ pub struct MlxService {
     pub keep_alive_secs: Arc<AtomicI64>,
     /// Per-request cancellation flags keyed by request/chat ID.
     pub active_requests: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// True while a model load/download is in progress.
+    pub is_loading: Arc<AtomicBool>,
 }
 
 impl MlxService {
@@ -78,6 +80,7 @@ impl MlxService {
             last_used_at: Arc::new(AtomicU64::new(0)),
             keep_alive_secs: Arc::new(AtomicI64::new(default_ka)),
             active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            is_loading: Arc::new(AtomicBool::new(false)),
             config: Arc::clone(&config),
         };
         // Apply Metal memory management: cache limit (user-configured or default 512 MB)
@@ -114,6 +117,11 @@ impl MlxService {
             });
         });
         svc
+    }
+
+    /// Number of currently active (in-progress) inference requests.
+    pub fn active_count(&self) -> usize {
+        self.active_requests.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Register a cancellable streaming request; returns the flag to pass into the generation loop.
@@ -227,9 +235,10 @@ impl MlxService {
         }
 
         info!("Loading model: {} (adapter: {:?}, drafter: {:?})", model_id, adapter, drafter);
+        self.is_loading.store(true, Ordering::Relaxed);
         let mid = model_id.clone();
         let moe_top_k = self.config.moe_top_k;
-        let (model_py, tokenizer_py, draft_model_py) = tokio::task::spawn_blocking(move || {
+        let load_result = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| -> PyResult<(PyObject, PyObject, Option<PyObject>)> {
                 let mlx_lm = py.import("mlx_lm")?;
                 let kwargs = PyDict::new(py);
@@ -257,10 +266,13 @@ impl MlxService {
 
                 Ok((model, tokenizer, draft))
             })
-        })
-        .await
-        .map_err(|e| MlxError::LoadFailed(e.to_string()))?
-        .map_err(|e: PyErr| MlxError::LoadFailed(e.to_string()))?;
+        });
+        let load_result = load_result
+            .await
+            .map_err(|e| MlxError::LoadFailed(e.to_string()))
+            .and_then(|r| r.map_err(|e: PyErr| MlxError::LoadFailed(e.to_string())));
+        self.is_loading.store(false, Ordering::Relaxed);
+        let (model_py, tokenizer_py, draft_model_py) = load_result?;
 
         let loaded_at_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)

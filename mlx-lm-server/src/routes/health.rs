@@ -2,16 +2,33 @@ use axum::{extract::State, http::header, response::IntoResponse, Json};
 use crate::models::HealthResponse;
 use crate::state::AppState;
 use serde_json::{json, Value};
+use std::sync::atomic::Ordering;
 
 pub async fn root() -> Json<Value> {
     Json(json!({ "message": "MLX LM Server is running", "docs": "/health" }))
 }
 
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let model_loaded = state.mlx.is_loaded().await;
+    let is_loading = state.mlx.is_loading.load(Ordering::Relaxed);
+    let active = state.mlx.active_count();
+    let queued = state.queued_requests.load(Ordering::Relaxed);
+    let max_concurrent = state.config.max_concurrent;
+
+    let status = if is_loading {
+        "loading_model"
+    } else if active >= max_concurrent && max_concurrent > 0 {
+        "no_slot_available"
+    } else {
+        "ok"
+    };
+
     Json(HealthResponse {
-        status: "ok",
-        model_loaded: state.mlx.is_loaded().await,
+        status,
+        model_loaded,
         current_model: state.mlx.current_model().await,
+        active_requests: active,
+        queued_requests: queued,
     })
 }
 

@@ -711,9 +711,14 @@ impl ModelList {
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
+    /// "ok" | "loading_model" | "no_slot_available"
     pub status: &'static str,
     pub model_loaded: bool,
     pub current_model: Option<String>,
+    /// Inference requests currently running (holding a semaphore slot).
+    pub active_requests: usize,
+    /// Inference requests waiting to acquire a semaphore slot.
+    pub queued_requests: usize,
 }
 
 #[derive(Debug, Serialize)]

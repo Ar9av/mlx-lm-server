@@ -20,7 +20,7 @@ pub async fn embeddings(
     };
     let n = texts.len();
 
-    let _permit = match state.inference_sem.clone().acquire_owned().await {
+    let _permit = match state.acquire_inference_slot().await {
         Ok(p) => p,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),

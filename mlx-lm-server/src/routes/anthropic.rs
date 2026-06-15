@@ -39,7 +39,7 @@ pub async fn messages(
         let max_tokens = req.max_tokens;
         let temperature = req.temperature.unwrap_or(state.config.default_temperature);
         let top_p = req.top_p.unwrap_or(state.config.default_top_p);
-        let _permit = match state.inference_sem.clone().acquire_owned().await {
+        let _permit = match state.acquire_inference_slot().await {
             Ok(p) => p,
             Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),
@@ -67,7 +67,7 @@ pub async fn messages(
     let kv_group_size = req.kv_group_size;
     let adapter_name = req.adapter_name.clone();
 
-    let _permit = match state.inference_sem.clone().acquire_owned().await {
+    let _permit = match state.acquire_inference_slot().await {
         Ok(p) => p,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "inference queue closed"}))).into_response(),

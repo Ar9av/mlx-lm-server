@@ -154,7 +154,7 @@ pub async fn create_response(
         }
     }
 
-    let _permit = match state.inference_sem.clone().acquire_owned().await {
+    let _permit = match state.acquire_inference_slot().await {
         Ok(p) => p,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "inference queue closed"}))).into_response(),
     };

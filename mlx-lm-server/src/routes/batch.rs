@@ -69,6 +69,7 @@ pub async fn create_batch(
     let default_temperature = state.config.default_temperature;
     let default_top_p = state.config.default_top_p;
     let inference_sem = state.inference_sem.clone();
+    let queued_requests = state.queued_requests.clone();
 
     tokio::spawn(async move {
         {
@@ -146,7 +147,10 @@ pub async fn create_batch(
             let seed = chat_req.seed;
             let session_id = chat_req.session_id.clone();
 
-            let _permit = match inference_sem.clone().acquire_owned().await {
+            queued_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let slot = inference_sem.clone().acquire_owned().await;
+            queued_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let _permit = match slot {
                 Ok(p) => p,
                 Err(_) => {
                     let err_entry = serde_json::json!({
