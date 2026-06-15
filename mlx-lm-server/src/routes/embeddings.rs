@@ -41,7 +41,7 @@ pub async fn embeddings(
                 object: "list",
                 data,
                 model: model_name,
-                usage: Usage { prompt_tokens: n, completion_tokens: 0, total_tokens: n },
+                usage: Usage { prompt_tokens: n, completion_tokens: 0, total_tokens: n, ..Default::default() },
             };
             (StatusCode::OK, Json(resp)).into_response()
         }

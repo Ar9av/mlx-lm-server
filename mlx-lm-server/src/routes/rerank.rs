@@ -74,6 +74,7 @@ pub async fn rerank(
             prompt_tokens: doc_count + 1,
             completion_tokens: 0,
             total_tokens: doc_count + 1,
+            ..Default::default()
         },
     };
 

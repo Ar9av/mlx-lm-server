@@ -66,11 +66,23 @@ pub struct ChatMessage {
     pub content: MessageContent,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// Sampling parameters threaded through all generation calls.
@@ -214,6 +226,8 @@ pub struct ChatCompletionRequest {
     /// -1 = never auto-unload, 0 = unload immediately, positive = TTL in seconds.
     /// Overrides the server default (MLX_KEEP_ALIVE_SECS, default 300).
     pub keep_alive: Option<i64>,
+    /// When set with `stream: true`, a final usage-only chunk is emitted before [DONE].
+    pub stream_options: Option<StreamOptions>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -306,6 +320,8 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 impl ChatCompletionChunk {
@@ -346,6 +362,7 @@ impl ChatCompletionChunk {
                 finish_reason: None,
                 logprobs,
             }],
+            usage: None,
         }
     }
 
@@ -365,6 +382,7 @@ impl ChatCompletionChunk {
                 finish_reason: Some(reason.to_string()),
                 logprobs: None,
             }],
+            usage: None,
         }
     }
 
@@ -380,6 +398,20 @@ impl ChatCompletionChunk {
                 finish_reason: Some("tool_calls".to_string()),
                 logprobs: None,
             }],
+            usage: None,
+        }
+    }
+
+    /// Emitted as the penultimate chunk when `stream_options.include_usage` is true.
+    /// Has empty choices so clients that key on choices[0] still work.
+    pub fn usage_chunk(id: &str, model: &str, usage: Usage) -> Self {
+        Self {
+            id: id.to_string(),
+            object: "chat.completion.chunk",
+            created: now_secs(),
+            model: model.to_string(),
+            choices: vec![],
+            usage: Some(usage),
         }
     }
 }

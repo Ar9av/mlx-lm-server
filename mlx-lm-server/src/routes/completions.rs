@@ -50,7 +50,7 @@ pub async fn completions(
                 MlxService::new_chat_id(),
                 model_name,
                 text,
-                Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
+                Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens, ..Default::default() },
             );
             (StatusCode::OK, Json(resp)).into_response()
         }

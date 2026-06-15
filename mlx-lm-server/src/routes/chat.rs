@@ -6,6 +6,8 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::time::Duration;
 use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{error, info};
@@ -57,7 +59,7 @@ pub async fn chat_completions(
                     MlxService::new_chat_id(),
                     model_name,
                     content,
-                    crate::models::Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
+                    crate::models::Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens, ..Default::default() },
                 );
                 (StatusCode::OK, Json(resp)).into_response()
             }
@@ -183,6 +185,7 @@ async fn sync_response(
     let mut choices: Vec<crate::models::ChatCompletionChoice> = Vec::with_capacity(n as usize);
     let mut total_prompt = 0usize;
     let mut total_completion = 0usize;
+    let t_gen_start = std::time::Instant::now();
 
     // Extract JSON schema for post-generation validation
     let json_validation_schema = req.response_format.as_ref().and_then(|rf| match rf.kind.as_str() {
@@ -296,7 +299,15 @@ async fn sync_response(
 
     state.mlx.touch_keep_alive(req.keep_alive);
 
-    let usage = Usage { prompt_tokens: total_prompt, completion_tokens: total_completion, total_tokens: total_prompt + total_completion };
+    let total_ms = t_gen_start.elapsed().as_millis() as u64;
+    let usage = Usage {
+        prompt_tokens: total_prompt,
+        completion_tokens: total_completion,
+        total_tokens: total_prompt + total_completion,
+        total_ms: Some(total_ms),
+        prompt_eval_ms: None,
+        eval_ms: None,
+    };
     let resp = crate::models::ChatCompletionResponse {
         id: chat_id,
         object: "chat.completion",
@@ -333,6 +344,11 @@ async fn stream_response(
     let model_name = state.mlx.current_model().await.unwrap_or(req.model.clone());
     let chat_id = MlxService::new_chat_id();
     let timeout = state.config.stream_timeout;
+    let include_usage = req.stream_options.as_ref().map_or(false, |o| o.include_usage);
+
+    let t_stream_start = std::time::Instant::now();
+    let ttft_ms = Arc::new(AtomicU64::new(0));
+    let comp_count = Arc::new(AtomicUsize::new(0));
 
     let (token_stream, session_info) = match state.mlx.generate_stream(
         chat_id.clone(), messages, max_tokens, sampler, timeout, chat_template_kwargs, kv_bits, kv_group_size, adapter_name, tools, stop_strings, want_logprobs, top_n_logprobs, seed, session_id,
@@ -352,6 +368,10 @@ async fn stream_response(
     // Reasoning state machine: track whether we're inside <think>...</think>
     let mut in_think = false;
     let mut think_buf = String::new(); // partial tag accumulation for split-chunk detection
+    // Timing atomics shared with the done-future
+    let ttft_ms_w = Arc::clone(&ttft_ms);
+    let comp_count_w = Arc::clone(&comp_count);
+    let t0_clone = t_stream_start.clone();
 
     // Wrap the token stream with keep-alive timeouts so the client doesn't disconnect
     // during long prefill phases. SSE comment lines are ignored by all clients.
@@ -395,6 +415,9 @@ async fn stream_response(
                         .trim_start_matches(TOOL_SENTINEL)
                         .trim_end_matches('\x00');
                     let tool_calls: Vec<ToolCall> = serde_json::from_str(json_part).unwrap_or_default();
+                    // Count as one completion unit for usage tracking
+                    let prev = comp_count_w.fetch_add(1, Ordering::Relaxed);
+                    if prev == 0 { ttft_ms_w.compare_exchange(0, t0_clone.elapsed().as_millis() as u64, Ordering::Relaxed, Ordering::Relaxed).ok(); }
                     let chunk = ChatCompletionChunk::tool_calls_chunk(&chat_id_clone, &model_clone, tool_calls);
                     serde_json::to_string(&chunk).unwrap_or_default()
                 } else {
@@ -402,6 +425,10 @@ async fn stream_response(
                     let (content_text, reasoning_text, new_in_think) =
                         classify_token(&token, &mut think_buf, in_think);
                     in_think = new_in_think;
+
+                    // Track TTFT on first real output token
+                    let prev = comp_count_w.fetch_add(1, Ordering::Relaxed);
+                    if prev == 0 { ttft_ms_w.compare_exchange(0, t0_clone.elapsed().as_millis() as u64, Ordering::Relaxed, Ordering::Relaxed).ok(); }
 
                     let lp = pending_lp.take();
                     let is_first = first;
@@ -431,11 +458,34 @@ async fn stream_response(
     let mlx_svc = state.mlx.clone();
     let combined = futures::StreamExt::chain(sse_stream, futures::stream::once(async move {
         let reason = finish_reason.lock().map(|g| g.clone()).unwrap_or_else(|_| "stop".into());
-        let final_chunk = ChatCompletionChunk::finish(&chat_id, &model_name, &reason);
-        let final_data = format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            serde_json::to_string(&final_chunk).unwrap_or_default()
-        );
+        let finish_chunk = ChatCompletionChunk::finish(&chat_id, &model_name, &reason);
+
+        let final_data = if include_usage {
+            let total_ms_val = t_stream_start.elapsed().as_millis() as u64;
+            let ttft_val = ttft_ms.load(Ordering::Relaxed);
+            let n_comp = comp_count.load(Ordering::Relaxed);
+            let prompt_tokens = session_info.as_ref().map_or(0, |(_, _, pt)| *pt);
+            let usage = Usage {
+                prompt_tokens,
+                completion_tokens: n_comp,
+                total_tokens: prompt_tokens + n_comp,
+                prompt_eval_ms: Some(ttft_val),
+                eval_ms: Some(total_ms_val.saturating_sub(ttft_val)),
+                total_ms: Some(total_ms_val),
+            };
+            let usage_chunk = ChatCompletionChunk::usage_chunk(&chat_id, &model_name, usage);
+            format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&finish_chunk).unwrap_or_default(),
+                serde_json::to_string(&usage_chunk).unwrap_or_default(),
+            )
+        } else {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&finish_chunk).unwrap_or_default()
+            )
+        };
+
         drop(permit);
         // Commit session KV cache after stream ends (Python mutated it in-place)
         if let Some((sid, kv_cache, _)) = session_info {
