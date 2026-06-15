@@ -707,6 +707,27 @@ impl ModelList {
     }
 }
 
+// ── Memory estimation ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct MemoryEstimateResponse {
+    pub model_id: String,
+    /// True when the model is present in the local HF cache.
+    pub cached: bool,
+    /// Bytes occupied by all .safetensors weight files.
+    pub weight_bytes: u64,
+    /// Weight bytes converted to GB (weight_bytes / 1e9).
+    pub weight_gb: f64,
+    /// Rough total estimate: weights + ~25% overhead (activations, Metal buffers, KV room).
+    pub estimated_total_gb: f64,
+    /// Number of .safetensors files found.
+    pub files_found: usize,
+    /// Quantization bits from config.json, if available.
+    pub quantization_bits: Option<serde_json::Value>,
+    /// Path to the snapshot directory used for measurement.
+    pub snapshot_path: Option<String>,
+}
+
 // ── Health / ps ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]

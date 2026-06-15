@@ -13,7 +13,7 @@ use tokio::fs;
 use tracing::warn;
 
 use crate::mlx_service::process_rss_mb;
-use crate::models::{HfModel, LoadedModelEntry, LoadedModelsResponse, LocalModel, ModelInfo, ModelList, ModelLoadRequest, ModelObject, PsResponse, QuantizationInfo};
+use crate::models::{HfModel, LoadedModelEntry, LoadedModelsResponse, LocalModel, MemoryEstimateResponse, ModelInfo, ModelList, ModelLoadRequest, ModelObject, PsResponse, QuantizationInfo};
 use crate::state::AppState;
 
 // ── /v1/models — returns all locally cached models (loaded model marked) ─────
@@ -191,6 +191,83 @@ fn hf_cache_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".cache/huggingface/hub")
+}
+
+pub async fn estimate_memory(
+    Path(model_id): Path<String>,
+) -> impl IntoResponse {
+    let dir_name = format!("models--{}", model_id.replace('/', "--"));
+    let snap_path = find_latest_snapshot(&hf_cache_dir().join(&dir_name)).await;
+
+    let (cached, snapshot_path_str, weight_bytes, files_found, quantization_bits) = match snap_path {
+        None => (false, None, 0u64, 0usize, None),
+        Some(ref snap) => {
+            let (bytes, count) = safetensors_size(snap).await;
+            let bits = read_quantization(snap).await.and_then(|q| q.bits);
+            (true, Some(snap.to_string_lossy().to_string()), bytes, count, bits)
+        }
+    };
+
+    let weight_gb = weight_bytes as f64 / 1e9;
+    let estimated_total_gb = weight_gb * 1.25;
+
+    Json(MemoryEstimateResponse {
+        model_id,
+        cached,
+        weight_bytes,
+        weight_gb,
+        estimated_total_gb,
+        files_found,
+        quantization_bits,
+        snapshot_path: snapshot_path_str,
+    })
+}
+
+/// Walk a model cache directory and sum bytes of all `.safetensors` files.
+/// Uses `fs::metadata` (follows symlinks) because HF Hub snapshot dirs contain symlinks
+/// pointing to blobs; `DirEntry::metadata` would return the symlink length (a few dozen bytes).
+async fn safetensors_size(path: &PathBuf) -> (u64, usize) {
+    let mut total = 0u64;
+    let mut count = 0usize;
+    let mut stack = vec![path.clone()];
+    while let Some(p) = stack.pop() {
+        let mut rd = match fs::read_dir(&p).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let entry_path = entry.path();
+            // Follow symlinks to get the real file size
+            let meta = match fs::metadata(&entry_path).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(entry_path);
+            } else if entry.file_name().to_string_lossy().ends_with(".safetensors") {
+                total += meta.len();
+                count += 1;
+            }
+        }
+    }
+    (total, count)
+}
+
+/// Find the most-recently-modified snapshot directory under `model_path/snapshots/`.
+async fn find_latest_snapshot(model_path: &PathBuf) -> Option<PathBuf> {
+    let snapshots = model_path.join("snapshots");
+    let mut snaps = fs::read_dir(&snapshots).await.ok()?;
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    while let Ok(Some(snap)) = snaps.next_entry().await {
+        if let Ok(meta) = snap.metadata().await {
+            if let Ok(modified) = meta.modified() {
+                if latest.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+                    latest = Some((modified, snap.path()));
+                }
+            }
+        }
+    }
+    latest.map(|(_, p)| p)
 }
 
 pub async fn list_local_models() -> Json<Vec<LocalModel>> {
