@@ -10,7 +10,7 @@ OpenAI-compatible inference servers for Apple Silicon — LLM, image generation,
 
 | Server | Capability | Port |
 |---|---|---|
-| `mlx-lm-server` | Chat completions, embeddings, vision, LoRA, fine-tuning | `8080` |
+| `mlx-lm-server` | Chat completions, embeddings, vision, LoRA, fine-tuning | `8000` |
 | `mlx-audio-server` | TTS, STT, audio translation, source separation | `8001` |
 | `mlx-image-server` | FLUX.2-klein text-to-image, 9s/image on M-series | `8002` |
 
@@ -39,7 +39,7 @@ pip install mlx mlx-lm mflux mlx-audio
 ## Quick start
 
 ```bash
-# LLM — chat completions on :8080
+# LLM — chat completions on :8000
 ./run.sh lm
 
 # Image generation — FLUX.2 on :8002
@@ -55,14 +55,17 @@ Models are downloaded automatically on first use. Force a rebuild after Rust cha
 
 ```bash
 # Load a model
-curl -X POST http://localhost:8080/v1/models/load \
+curl -X POST http://localhost:8000/v1/models/load \
   -H 'Content-Type: application/json' \
   -d '{"model": "mlx-community/Llama-3.2-3B-Instruct-4bit"}'
 
 # Chat
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"llama","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Simple browser UI
+open http://localhost:8000/ui
 
 # Generate an image (downloads ~4 GB on first run, then cached)
 curl http://localhost:8002/v1/images/generations \
@@ -71,7 +74,7 @@ curl http://localhost:8002/v1/images/generations \
   | python3 -c "import sys,json,base64; open('out.png','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
 ```
 
-Works as a drop-in replacement for the OpenAI API — point any OpenAI SDK at `http://localhost:8080/v1`.
+Works as a drop-in replacement for the OpenAI API — point any OpenAI SDK at `http://localhost:8000/v1`.
 
 ---
 
@@ -136,6 +139,7 @@ mlx-lm ships a built-in Python server. This wraps it in a Rust HTTP layer with s
 - **Chat completions** (`POST /v1/chat/completions`) — streaming SSE + sync
 - **Anthropic messages** (`POST /v1/messages`)
 - **Text completions** (`POST /v1/completions`)
+- **Built-in chat UI** (`GET /ui`) — simple browser client with model picker
 - **Embeddings** (`POST /v1/embeddings`)
 - **Reranking** (`POST /v1/rerank`) — cosine similarity scoring for RAG pipelines
 - **Vision** — auto-routes `image_url` messages to `mlx_vlm`
@@ -190,17 +194,17 @@ Tested on Apple M-series, `mlx-community/Llama-3.2-1B-Instruct-4bit`:
 
 ```bash
 # Load a model
-curl -X POST http://localhost:8080/v1/models/load \
+curl -X POST http://localhost:8000/v1/models/load \
   -H 'Content-Type: application/json' \
   -d '{"model": "mlx-community/Llama-3.2-3B-Instruct-4bit"}'
 
 # Chat (streaming)
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"llama","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
 # Tool use
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "llama",
@@ -209,7 +213,7 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 
 # Prompt cache (reuse KV across turns)
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"llama","messages":[{"role":"user","content":"My name is Alice."}],"session_id":"conv-1"}'
 

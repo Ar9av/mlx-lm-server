@@ -20,7 +20,7 @@ case "$MODE" in
   *)
     echo "Usage: $0 <lm|audio|image> [server-flags...]"
     echo ""
-    echo "  lm     — OpenAI-compatible chat / completions server  (port 8080)"
+    echo "  lm     — OpenAI-compatible chat / completions server  (port 8000)"
     echo "  audio  — TTS / STT / STS server                       (port 8001)"
     echo "  image  — FLUX.1 image generation server               (port 8002)"
     echo ""

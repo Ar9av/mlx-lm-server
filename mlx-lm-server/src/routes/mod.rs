@@ -14,4 +14,5 @@ pub mod prefix_cache;
 pub mod rerank;
 pub mod responses;
 pub mod train;
+pub mod ui;
 pub mod vector_store;

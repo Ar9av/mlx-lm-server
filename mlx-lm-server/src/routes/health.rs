@@ -1,11 +1,11 @@
-use axum::{extract::State, http::header, response::IntoResponse, Json};
 use crate::models::HealthResponse;
 use crate::state::AppState;
+use axum::{extract::State, http::header, response::IntoResponse, Json};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 
 pub async fn root() -> Json<Value> {
-    Json(json!({ "message": "MLX LM Server is running", "docs": "/health" }))
+    Json(json!({ "message": "MLX LM Server is running", "docs": "/health", "ui": "/ui" }))
 }
 
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -129,8 +129,5 @@ drafter: string — draft model ID for speculative decoding (+1.4x throughput)
 ### GET /llms.txt
 This document (machine-readable API reference).
 "#;
-    (
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        body,
-    )
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
 }

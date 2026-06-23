@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MLX Local Chat</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe4;
+      --panel: rgba(255, 251, 245, 0.92);
+      --panel-strong: #fffdf8;
+      --ink: #1d1b19;
+      --muted: #6f665d;
+      --line: rgba(65, 52, 40, 0.14);
+      --accent: #0f766e;
+      --accent-2: #c2410c;
+      --user: #e0f2fe;
+      --assistant: #fef3c7;
+      --shadow: 0 24px 60px rgba(76, 56, 34, 0.14);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.15), transparent 30%),
+        radial-gradient(circle at top right, rgba(194, 65, 12, 0.14), transparent 25%),
+        linear-gradient(180deg, #f8f3ea 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+
+    .shell {
+      width: min(1100px, calc(100vw - 32px));
+      margin: 24px auto;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 18px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .sidebar {
+      padding: 20px;
+    }
+
+    .title {
+      margin: 0 0 6px;
+      font-size: 2rem;
+      line-height: 1;
+      letter-spacing: -0.03em;
+    }
+
+    .subtitle {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 0.98rem;
+    }
+
+    .field {
+      margin-bottom: 14px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    select,
+    textarea,
+    input,
+    button {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      font: inherit;
+    }
+
+    select,
+    input,
+    textarea {
+      padding: 12px 14px;
+      background: var(--panel-strong);
+      color: var(--ink);
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 120px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    button {
+      padding: 12px 16px;
+      cursor: pointer;
+      transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.7;
+    }
+
+    .primary {
+      background: var(--accent);
+      color: #f7fffd;
+      border-color: transparent;
+      box-shadow: 0 10px 24px rgba(15, 118, 110, 0.22);
+    }
+
+    .secondary {
+      background: transparent;
+      color: var(--ink);
+    }
+
+    .chat {
+      display: flex;
+      flex-direction: column;
+      min-height: 78vh;
+      overflow: hidden;
+    }
+
+    .chat-head {
+      padding: 22px 24px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .messages {
+      flex: 1;
+      overflow: auto;
+      padding: 18px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .message {
+      max-width: min(760px, 92%);
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      white-space: pre-wrap;
+      line-height: 1.45;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: var(--user);
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      background: var(--assistant);
+    }
+
+    .composer {
+      padding: 16px 24px 24px;
+      border-top: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255,255,255,0), rgba(255, 251, 245, 0.9));
+    }
+
+    .composer textarea {
+      min-height: 110px;
+    }
+
+    .composer-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .composer-actions button {
+      width: auto;
+      min-width: 128px;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 20px 6px;
+      text-align: center;
+      border: 1px dashed var(--line);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.35);
+    }
+
+    @media (max-width: 900px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .chat {
+        min-height: 70vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <aside class="panel sidebar">
+      <h1 class="title">MLX Local Chat</h1>
+      <p class="subtitle">Simple chat UI for the local OpenAI-compatible server.</p>
+
+      <div class="field">
+        <label for="model">Model</label>
+        <select id="model">
+          <option value="">Loading models...</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="system">System prompt</label>
+        <textarea id="system" placeholder="Optional system instruction"></textarea>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="temperature">Temperature</label>
+          <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7">
+        </div>
+        <div class="field">
+          <label for="maxTokens">Max tokens</label>
+          <input id="maxTokens" type="number" min="1" step="1" value="256">
+        </div>
+      </div>
+
+      <div class="field">
+        <button id="reloadModels" class="secondary" type="button">Reload models</button>
+      </div>
+
+      <div class="field">
+        <button id="clearChat" class="secondary" type="button">Clear chat</button>
+      </div>
+    </aside>
+
+    <section class="panel chat">
+      <div class="chat-head">
+        <div id="status" class="status">Connecting...</div>
+      </div>
+      <div id="messages" class="messages">
+        <div class="empty">Select a model, type a message, and send it.</div>
+      </div>
+      <form id="composer" class="composer">
+        <textarea id="prompt" placeholder="Ask something"></textarea>
+        <div class="composer-actions">
+          <button id="send" class="primary" type="submit">Send</button>
+          <button id="stop" class="secondary" type="button" disabled>Busy</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      messages: [],
+      busy: false
+    };
+
+    const els = {
+      model: document.getElementById("model"),
+      system: document.getElementById("system"),
+      temperature: document.getElementById("temperature"),
+      maxTokens: document.getElementById("maxTokens"),
+      reloadModels: document.getElementById("reloadModels"),
+      clearChat: document.getElementById("clearChat"),
+      status: document.getElementById("status"),
+      messages: document.getElementById("messages"),
+      composer: document.getElementById("composer"),
+      prompt: document.getElementById("prompt"),
+      send: document.getElementById("send"),
+      stop: document.getElementById("stop")
+    };
+
+    function setStatus(text) {
+      els.status.textContent = text;
+    }
+
+    function renderMessages() {
+      els.messages.innerHTML = "";
+
+      if (!state.messages.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "Select a model, type a message, and send it.";
+        els.messages.appendChild(empty);
+        return;
+      }
+
+      for (const message of state.messages) {
+        const node = document.createElement("article");
+        node.className = `message ${message.role}`;
+        node.textContent = message.content;
+        els.messages.appendChild(node);
+      }
+
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+
+    function setBusy(busy) {
+      state.busy = busy;
+      els.send.disabled = busy;
+      els.stop.disabled = !busy;
+      els.stop.textContent = busy ? "Running" : "Idle";
+      els.send.textContent = busy ? "Sending..." : "Send";
+    }
+
+    function isLikelyChatModel(modelId) {
+      const id = String(modelId || "").toLowerCase();
+
+      const blockedHints = [
+        "kokoro",
+        "whisper",
+        "flux",
+        "sam-audio",
+        "bert-",
+        "sentence-transformers/",
+        "all-minilm",
+        "all-mpnet",
+        "t5-"
+      ];
+
+      if (blockedHints.some((hint) => id.includes(hint))) {
+        return false;
+      }
+
+      const preferredHints = [
+        "instruct",
+        "chat",
+        "qwen",
+        "llama",
+        "mistral",
+        "phi",
+        "gemma",
+        "deepseek"
+      ];
+
+      return preferredHints.some((hint) => id.includes(hint));
+    }
+
+    async function loadModels() {
+      setStatus("Loading models...");
+      try {
+        const response = await fetch("/v1/models");
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const currentValue = els.model.value;
+        const allModels = Array.isArray(data.data) ? data.data : [];
+        const preferredModels = allModels.filter((model) => isLikelyChatModel(model.id));
+        const modelsToShow = preferredModels.length ? preferredModels : allModels;
+        els.model.innerHTML = "";
+
+        if (!modelsToShow.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "No local models found";
+          els.model.appendChild(option);
+          setStatus("No local models found. Load or download one first.");
+          return;
+        }
+
+        for (const model of modelsToShow) {
+          const option = document.createElement("option");
+          option.value = model.id;
+          option.textContent = model.id;
+          if (model.id === currentValue) {
+            option.selected = true;
+          }
+          els.model.appendChild(option);
+        }
+
+        if (!els.model.value) {
+          els.model.selectedIndex = 0;
+        }
+        setStatus(`Ready on ${window.location.origin}`);
+      } catch (error) {
+        els.model.innerHTML = '<option value="">Unavailable</option>';
+        setStatus(`Failed to load models: ${error.message}`);
+      }
+    }
+
+    async function sendMessage(event) {
+      event.preventDefault();
+      if (state.busy) {
+        return;
+      }
+
+      const prompt = els.prompt.value.trim();
+      const model = els.model.value;
+      if (!model) {
+        setStatus("Choose a model first.");
+        return;
+      }
+      if (!prompt) {
+        setStatus("Enter a message first.");
+        return;
+      }
+
+      const systemPrompt = els.system.value.trim();
+      const temperature = Number(els.temperature.value);
+      const maxTokens = Number(els.maxTokens.value);
+
+      state.messages.push({ role: "user", content: prompt });
+      renderMessages();
+      els.prompt.value = "";
+      setBusy(true);
+      setStatus(`Querying ${model}...`);
+
+      const apiMessages = [];
+      if (systemPrompt) {
+        apiMessages.push({ role: "system", content: systemPrompt });
+      }
+      for (const message of state.messages) {
+        apiMessages.push({ role: message.role, content: message.content });
+      }
+
+      try {
+        const response = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model,
+            messages: apiMessages,
+            temperature,
+            max_tokens: maxTokens
+          })
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          const errorMessage = data?.error?.message || data?.error || `HTTP ${response.status}`;
+          throw new Error(String(errorMessage));
+        }
+
+        const content = data?.choices?.[0]?.message?.content || "";
+        state.messages.push({ role: "assistant", content });
+        renderMessages();
+        setStatus(`Response received from ${data.model || model}.`);
+      } catch (error) {
+        state.messages.push({ role: "assistant", content: `Error: ${error.message}` });
+        renderMessages();
+        setStatus("Request failed.");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    els.reloadModels.addEventListener("click", loadModels);
+    els.clearChat.addEventListener("click", () => {
+      state.messages = [];
+      renderMessages();
+      setStatus("Chat cleared.");
+    });
+    els.composer.addEventListener("submit", sendMessage);
+    els.prompt.addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        els.composer.requestSubmit();
+      }
+    });
+
+    renderMessages();
+    loadModels();
+  </script>
+</body>
+</html>

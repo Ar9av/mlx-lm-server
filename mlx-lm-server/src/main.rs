@@ -54,7 +54,10 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
 
 async fn metrics_handler() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         metrics::render(),
     )
 }
@@ -85,6 +88,7 @@ async fn main() {
     let app = Router::new()
         // Info
         .route("/", get(routes::health::root))
+        .route("/ui", get(routes::ui::chat_ui))
         .route("/health", get(routes::health::health))
         .route("/status", get(routes::health::status))
         .route("/llms.txt", get(routes::health::llms_txt))
@@ -92,7 +96,10 @@ async fn main() {
         // OpenAI-compatible
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
-        .route("/v1/completions/:request_id", delete(routes::completions::cancel_completion))
+        .route(
+            "/v1/completions/:request_id",
+            delete(routes::completions::cancel_completion),
+        )
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
         .route("/v1/tokenize", post(routes::chat::tokenize))
         .route("/infill", post(routes::infill::infill))
@@ -101,50 +108,110 @@ async fn main() {
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/models/load", post(routes::models::load_model))
         .route("/v1/models/:model_id/info", get(routes::models::model_info))
-        .route("/v1/models/:model_id/estimate-memory", get(routes::models::estimate_memory))
+        .route(
+            "/v1/models/:model_id/estimate-memory",
+            get(routes::models::estimate_memory),
+        )
         .route("/v1/models/:model_id", delete(routes::models::unload_model))
         // Adapter management
         .route("/v1/adapters", get(routes::adapters::list_adapters))
         .route("/v1/adapters/mount", post(routes::adapters::mount_adapter))
-        .route("/v1/adapters/:name", delete(routes::adapters::unmount_adapter))
-        .route("/v1/adapters/:name/fuse", post(routes::finetune::fuse_adapter))
+        .route(
+            "/v1/adapters/:name",
+            delete(routes::adapters::unmount_adapter),
+        )
+        .route(
+            "/v1/adapters/:name/fuse",
+            post(routes::finetune::fuse_adapter),
+        )
         // Fine-tuning (async jobs)
-        .route("/v1/train", post(routes::train::train).get(routes::train::list_training_jobs))
+        .route(
+            "/v1/train",
+            post(routes::train::train).get(routes::train::list_training_jobs),
+        )
         .route("/v1/train/:id", get(routes::train::get_training_job))
-        .route("/v1/train/:id/events", get(routes::train::training_job_events))
+        .route(
+            "/v1/train/:id/events",
+            get(routes::train::training_job_events),
+        )
         .route("/v1/convert", post(routes::finetune::convert))
         // Anthropic-compatible
         .route("/v1/messages", post(routes::anthropic::messages))
         // OpenAI Responses API (stateful conversations)
-        .route("/v1/responses", post(routes::responses::create_response).get(routes::responses::list_responses))
-        .route("/v1/responses/:id", get(routes::responses::get_response).delete(routes::responses::delete_response))
+        .route(
+            "/v1/responses",
+            post(routes::responses::create_response).get(routes::responses::list_responses),
+        )
+        .route(
+            "/v1/responses/:id",
+            get(routes::responses::get_response).delete(routes::responses::delete_response),
+        )
         // Loaded models with TTL
         .route("/v1/models/loaded", get(routes::models::list_loaded_models))
         // Model cache + discovery
         .route("/api/models/local", get(routes::models::list_local_models))
-        .route("/api/models/local/:org/*model", delete(routes::models::delete_local_model))
-        .route("/api/huggingface/models", get(routes::models::search_hf_models))
+        .route(
+            "/api/models/local/:org/*model",
+            delete(routes::models::delete_local_model),
+        )
+        .route(
+            "/api/huggingface/models",
+            get(routes::models::search_hf_models),
+        )
         .route("/api/ps", get(routes::models::ps))
         // Automatic Prefix Cache (APC)
-        .route("/v1/prefix_cache", get(routes::prefix_cache::get_prefix_cache_stats).delete(routes::prefix_cache::clear_prefix_cache))
-        .route("/v1/prefix_cache/save", post(routes::prefix_cache::save_prefix_cache))
-        .route("/v1/prefix_cache/load", post(routes::prefix_cache::load_prefix_cache))
-        .route("/v1/prefix_cache/saved", delete(routes::prefix_cache::erase_prefix_cache_file))
+        .route(
+            "/v1/prefix_cache",
+            get(routes::prefix_cache::get_prefix_cache_stats)
+                .delete(routes::prefix_cache::clear_prefix_cache),
+        )
+        .route(
+            "/v1/prefix_cache/save",
+            post(routes::prefix_cache::save_prefix_cache),
+        )
+        .route(
+            "/v1/prefix_cache/load",
+            post(routes::prefix_cache::load_prefix_cache),
+        )
+        .route(
+            "/v1/prefix_cache/saved",
+            delete(routes::prefix_cache::erase_prefix_cache_file),
+        )
         // Prompt cache sessions
-        .route("/v1/sessions/:session_id", delete(routes::chat::delete_session))
+        .route(
+            "/v1/sessions/:session_id",
+            delete(routes::chat::delete_session),
+        )
         // Benchmarking
         .route("/v1/benchmark", post(routes::benchmark::run_benchmark))
         // Reranking
         .route("/v1/rerank", post(routes::rerank::rerank))
         // Batch API
-        .route("/v1/batches", post(routes::batch::create_batch).get(routes::batch::list_batches))
+        .route(
+            "/v1/batches",
+            post(routes::batch::create_batch).get(routes::batch::list_batches),
+        )
         .route("/v1/batches/:id", get(routes::batch::get_batch))
         .route("/v1/batches/:id/cancel", post(routes::batch::cancel_batch))
         // Vector stores
-        .route("/v1/vector_stores", post(routes::vector_store::create_vector_store).get(routes::vector_store::list_vector_stores))
-        .route("/v1/vector_stores/:id", get(routes::vector_store::get_vector_store).delete(routes::vector_store::delete_vector_store))
-        .route("/v1/vector_stores/:id/documents", post(routes::vector_store::add_document))
-        .route("/v1/vector_stores/:id/search", post(routes::vector_store::search_documents))
+        .route(
+            "/v1/vector_stores",
+            post(routes::vector_store::create_vector_store)
+                .get(routes::vector_store::list_vector_stores),
+        )
+        .route(
+            "/v1/vector_stores/:id",
+            get(routes::vector_store::get_vector_store)
+                .delete(routes::vector_store::delete_vector_store),
+        )
+        .route(
+            "/v1/vector_stores/:id/documents",
+            post(routes::vector_store::add_document),
+        )
+        .route(
+            "/v1/vector_stores/:id/search",
+            post(routes::vector_store::search_documents),
+        )
         // Pipeline
         .route("/v1/pipeline", post(routes::pipeline::run_pipeline))
         // Middleware
@@ -164,26 +231,32 @@ async fn main() {
                 return;
             }
             match tokio::fs::read_to_string(&warm_file).await {
-                Ok(content) => match serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&content) {
-                    Ok(sets) => {
-                        use crate::models::{ChatMessage, MessageContent};
-                        let message_sets: Vec<Vec<ChatMessage>> = sets
-                            .into_iter()
-                            .map(|msgs| {
-                                msgs.into_iter()
-                                    .filter_map(|m| {
-                                        let role = m["role"].as_str()?.to_string();
-                                        let content = m["content"].as_str().unwrap_or("").to_string();
-                                        Some(ChatMessage { role, content: MessageContent::Text(content) })
-                                    })
-                                    .collect()
-                            })
-                            .collect();
-                        info!("Running warm-up for {} prompt set(s)", message_sets.len());
-                        warm_state.mlx.warm_up(message_sets).await;
+                Ok(content) => {
+                    match serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&content) {
+                        Ok(sets) => {
+                            use crate::models::{ChatMessage, MessageContent};
+                            let message_sets: Vec<Vec<ChatMessage>> = sets
+                                .into_iter()
+                                .map(|msgs| {
+                                    msgs.into_iter()
+                                        .filter_map(|m| {
+                                            let role = m["role"].as_str()?.to_string();
+                                            let content =
+                                                m["content"].as_str().unwrap_or("").to_string();
+                                            Some(ChatMessage {
+                                                role,
+                                                content: MessageContent::Text(content),
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                            info!("Running warm-up for {} prompt set(s)", message_sets.len());
+                            warm_state.mlx.warm_up(message_sets).await;
+                        }
+                        Err(e) => tracing::warn!("Warm-up: failed to parse {}: {}", warm_file, e),
                     }
-                    Err(e) => tracing::warn!("Warm-up: failed to parse {}: {}", warm_file, e),
-                },
+                }
                 Err(e) => tracing::warn!("Warm-up: cannot read {}: {}", warm_file, e),
             }
         });
@@ -208,7 +281,10 @@ async fn main() {
                 if last == 0 {
                     continue; // model loaded but never used yet; don't auto-unload
                 }
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 if now.saturating_sub(last) >= ka as u64 {
                     info!("keep_alive TTL expired ({}s idle), unloading model", ka);
                     ttl_state.mlx.unload_model().await;
@@ -217,7 +293,9 @@ async fn main() {
         });
     }
 
-    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse().expect("invalid address");
+    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
+        .parse()
+        .expect("invalid address");
     info!("MLX LM Server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
